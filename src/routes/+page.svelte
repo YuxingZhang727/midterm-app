@@ -11,17 +11,26 @@
 		{ id: 'night', label: 'Night', icon: 'N' }
 	];
 
+	const bubbleSeeds = [
+		{ x: 16, y: 22 },
+		{ x: 34, y: 63 },
+		{ x: 52, y: 30 },
+		{ x: 68, y: 58 },
+		{ x: 80, y: 28 },
+		{ x: 24, y: 44 }
+	];
+
 	const scenes = {
 		sleep: {
 			title: 'Sleep',
 			subtitle: 'Settle into gentle, slower textures.',
 			colors: {
-				bgA: '#6b7f97',
-				bgB: '#93a9bf',
-				panel: 'rgba(107, 127, 151, 0.68)',
-				bubble: '#c8d9e8',
-				text: '#f7fbff',
-				soft: '#e1edf7'
+				bgA: '#b8c6d2',
+				bgB: '#d6e0e8',
+				panel: 'rgba(247, 244, 238, 0.62)',
+				bubble: '#efe5d9',
+				text: '#4d4740',
+				soft: '#776f66'
 			},
 			presets: [
 				{ name: 'Moon Drift', mix: { rain: 0.65, ocean: 0.3, night: 0.45 } },
@@ -33,12 +42,12 @@
 			title: 'Focus',
 			subtitle: 'Clear distractions with stable, low-variation layers.',
 			colors: {
-				bgA: '#6f8f82',
-				bgB: '#9ec0b2',
-				panel: 'rgba(111, 143, 130, 0.68)',
-				bubble: '#cfe6dc',
-				text: '#f6fffb',
-				soft: '#e2f2ec'
+				bgA: '#bdcdbf',
+				bgB: '#dbe6d9',
+				panel: 'rgba(248, 245, 239, 0.62)',
+				bubble: '#f0e8db',
+				text: '#4d4941',
+				soft: '#787268'
 			},
 			presets: [
 				{ name: 'Green Signal', mix: { static: 0.4, wind: 0.25, rain: 0.2 } },
@@ -50,27 +59,46 @@
 			title: 'Customization',
 			subtitle: 'Build your own calm blend from scratch.',
 			colors: {
-				bgA: '#9f7f73',
-				bgB: '#d0b1a5',
-				panel: 'rgba(159, 127, 115, 0.68)',
-				bubble: '#f0d9cf',
-				text: '#fff8f4',
-				soft: '#f5e3db'
+				bgA: '#d2bfb2',
+				bgB: '#e9d9cf',
+				panel: 'rgba(249, 245, 240, 0.62)',
+				bubble: '#f3e8dc',
+				text: '#4f4741',
+				soft: '#7a7068'
 			},
 			presets: []
 		}
 	};
 
-	let activeScene = null;
+	let activeScene = 'sleep';
 	let drawerOpen = true;
 	let mixes = [];
 	let mixLabel = '';
 
 	let audioCtx;
 	const engines = new Map();
-	let bubbles = bubbleDefs.map((b) => ({ ...b, active: false, volume: 0.45 }));
+	let bubbles = bubbleDefs.map((b, i) => ({
+		...b,
+		active: false,
+		volume: 0.45,
+		x: bubbleSeeds[i].x,
+		y: bubbleSeeds[i].y,
+		drift: (i % 3) * 1.15
+	}));
 
 	let dragState = null;
+	let bubbleStageEl;
+	let draggingMixId = null;
+	let mixPointerDrag = null;
+	let suppressJarClick = false;
+	let activeJarKey = null;
+
+	const presetJars = Object.entries(scenes).flatMap(([sceneKey, scene]) =>
+		scene.presets.map((preset) => ({ ...preset, sceneKey }))
+	);
+
+	$: palette = scenes[activeScene].colors;
+	$: activeCount = bubbles.filter((b) => b.active).length;
 
 	function destroyAllEngines() {
 		for (const [, engine] of engines) {
@@ -114,16 +142,9 @@
 		localStorage.setItem('calm-mixes', JSON.stringify(mixes));
 	}
 
-	$: palette = activeScene ? scenes[activeScene].colors : null;
-	$: activeCount = bubbles.filter((b) => b.active).length;
-
 	function ensureContext() {
-		if (!audioCtx) {
-			audioCtx = new AudioContext();
-		}
-		if (audioCtx.state === 'suspended') {
-			audioCtx.resume();
-		}
+		if (!audioCtx) audioCtx = new AudioContext();
+		if (audioCtx.state === 'suspended') audioCtx.resume();
 	}
 
 	function createNoiseEngine(type) {
@@ -152,6 +173,7 @@
 				osc.start(now);
 				osc.stop(now + 0.2);
 			}, 900);
+
 			return {
 				setVolume(v) {
 					gain.gain.setTargetAtTime(v, audioCtx.currentTime, 0.08);
@@ -165,9 +187,7 @@
 
 		const buffer = audioCtx.createBuffer(1, audioCtx.sampleRate * 2, audioCtx.sampleRate);
 		const data = buffer.getChannelData(0);
-		for (let i = 0; i < data.length; i += 1) {
-			data[i] = Math.random() * 2 - 1;
-		}
+		for (let i = 0; i < data.length; i += 1) data[i] = Math.random() * 2 - 1;
 
 		source = new AudioBufferSourceNode(audioCtx, { buffer, loop: true });
 		const filter = new BiquadFilterNode(audioCtx, { type: 'lowpass', frequency: 1200, Q: 0.7 });
@@ -181,6 +201,7 @@
 			filter.frequency.value = 2500;
 		}
 		if (type === 'ocean') {
+			filter.type = 'lowpass';
 			filter.frequency.value = 700;
 			swellGain = new GainNode(audioCtx, { gain: 0.62 });
 			modOsc = new OscillatorNode(audioCtx, { frequency: 0.07, type: 'sine' });
@@ -266,22 +287,51 @@
 		});
 	}
 
-	function startBubbleDrag(e, id, volume) {
-		dragState = { id, startY: e.clientY, startVolume: volume };
+	function startBubbleDrag(e, bubble) {
+		if (!bubbleStageEl) return;
+		const stageRect = bubbleStageEl.getBoundingClientRect();
+		dragState = {
+			id: bubble.id,
+			startX: e.clientX,
+			startY: e.clientY,
+			originX: bubble.x,
+			originY: bubble.y,
+			stageWidth: stageRect.width,
+			stageHeight: stageRect.height,
+			moved: false
+		};
+		e.preventDefault();
 		window.addEventListener('pointermove', onBubbleDrag);
 		window.addEventListener('pointerup', stopBubbleDrag);
+		window.addEventListener('pointercancel', stopBubbleDrag);
 	}
 
 	function onBubbleDrag(e) {
 		if (!dragState) return;
-		const delta = dragState.startY - e.clientY;
-		setVolume(dragState.id, dragState.startVolume + delta / 260);
+		const deltaX = e.clientX - dragState.startX;
+		const deltaY = e.clientY - dragState.startY;
+		if (Math.abs(deltaX) > 4 || Math.abs(deltaY) > 4) dragState.moved = true;
+		const nextX = dragState.originX + (deltaX / dragState.stageWidth) * 100;
+		const nextY = dragState.originY + (deltaY / dragState.stageHeight) * 100;
+		const clampedX = Math.max(8, Math.min(92, nextX));
+		const clampedY = Math.max(16, Math.min(84, nextY));
+		bubbles = bubbles.map((bubble) =>
+			bubble.id === dragState.id ? { ...bubble, x: clampedX, y: clampedY } : bubble
+		);
 	}
 
 	function stopBubbleDrag() {
+		if (dragState && !dragState.moved) toggleBubble(dragState.id);
 		dragState = null;
 		window.removeEventListener('pointermove', onBubbleDrag);
 		window.removeEventListener('pointerup', stopBubbleDrag);
+		window.removeEventListener('pointercancel', stopBubbleDrag);
+	}
+
+	function adjustVolumeWithWheel(e, id) {
+		const delta = e.deltaY < 0 ? 0.04 : -0.04;
+		const current = bubbles.find((bubble) => bubble.id === id)?.volume ?? 0.45;
+		setVolume(id, current + delta);
 	}
 
 	function saveMix() {
@@ -299,106 +349,211 @@
 		applyPreset(jar.mix);
 	}
 
+	function applyPresetJar(sceneKey, mix) {
+		activeScene = sceneKey;
+		applyPreset(mix);
+	}
+
+	function jarToneStyle(sceneKey) {
+		const tone = scenes[sceneKey].colors;
+		return `--lid-a:${tone.bgA};--lid-b:${tone.bgB};--jar:${tone.bubble};--jar-glow:${tone.bgB};`;
+	}
+
+	function jarLiquidStyle(mix) {
+		return `--fill:${Math.max(15, Object.keys(mix).length * 18)}%;`;
+	}
+
+	function sceneTagStyle(sceneKey) {
+		const tone = scenes[sceneKey].colors;
+		return `--tag-bg:${tone.bgB};--tag-fg:${tone.text};--tag-border:${tone.bgA};`;
+	}
+
 	function clearAll() {
 		bubbles = bubbles.map((bubble) => {
 			updateEngineVolume(bubble.id, false, bubble.volume);
 			return { ...bubble, active: false };
 		});
+		activeJarKey = null;
 		void hardStopAudio();
+	}
+
+	function switchScene(sceneKey) {
+		activeScene = sceneKey;
+		activeJarKey = null;
+	}
+
+	function moveMixToTarget(dragId, targetId) {
+		if (dragId === targetId) return;
+		const fromIndex = mixes.findIndex((mix) => mix.id === dragId);
+		const toIndex = mixes.findIndex((mix) => mix.id === targetId);
+		if (fromIndex < 0 || toIndex < 0) return;
+		const reordered = [...mixes];
+		const [moved] = reordered.splice(fromIndex, 1);
+		reordered.splice(toIndex, 0, moved);
+		mixes = reordered;
+	}
+
+	function onMixPointerMove(event) {
+		if (!mixPointerDrag) return;
+		const dx = event.clientX - mixPointerDrag.startX;
+		const dy = event.clientY - mixPointerDrag.startY;
+		if (!mixPointerDrag.moved && Math.hypot(dx, dy) > 6) mixPointerDrag.moved = true;
+	}
+
+	function endMixPointerDrag() {
+		if (mixPointerDrag?.moved) {
+			suppressJarClick = true;
+			setTimeout(() => {
+				suppressJarClick = false;
+			}, 0);
+		}
+		mixPointerDrag = null;
+		draggingMixId = null;
+		window.removeEventListener('pointermove', onMixPointerMove);
+		window.removeEventListener('pointerup', endMixPointerDrag);
+		window.removeEventListener('pointercancel', endMixPointerDrag);
+	}
+
+	function startMixPointerDrag(event, id) {
+		if (event.button !== 0) return;
+		mixPointerDrag = { id, startX: event.clientX, startY: event.clientY, moved: false };
+		draggingMixId = id;
+		window.addEventListener('pointermove', onMixPointerMove);
+		window.addEventListener('pointerup', endMixPointerDrag);
+		window.addEventListener('pointercancel', endMixPointerDrag);
+	}
+
+	function hoverMixTarget(targetId) {
+		if (!mixPointerDrag?.moved || !draggingMixId) return;
+		if (draggingMixId === targetId) return;
+		moveMixToTarget(draggingMixId, targetId);
+	}
+
+	function handleSavedJarClick(jar) {
+		if (suppressJarClick) return;
+		const jarKey = `mix:${jar.id}`;
+		if (activeJarKey === jarKey) {
+			clearAll();
+			return;
+		}
+		loadMix(jar);
+		activeJarKey = jarKey;
+	}
+
+	function handlePresetJarClick(preset) {
+		const jarKey = `preset:${preset.sceneKey}:${preset.name}`;
+		if (activeJarKey === jarKey) {
+			clearAll();
+			return;
+		}
+		applyPresetJar(preset.sceneKey, preset.mix);
+		activeJarKey = jarKey;
 	}
 </script>
 
-{#if !activeScene}
-	<main class="entry-screen">
-		<section>
-			<h1>Calm Cabinet</h1>
-			<p>Choose your current state to enter a focused sound environment.</p>
-		</section>
-		<div class="scene-grid">
-			{#each Object.entries(scenes) as [sceneKey, scene]}
-				<button class="scene-card" style={`--bgA:${scene.colors.bgA};--bgB:${scene.colors.bgB};--text:${scene.colors.text}`} on:click={() => (activeScene = sceneKey)}>
-					<h2>{scene.title}</h2>
-					<p>{scene.subtitle}</p>
+<main class="workspace" style={`--bgA:${palette.bgA};--bgB:${palette.bgB};--panel:${palette.panel};--bubble:${palette.bubble};--text:${palette.text};--soft:${palette.soft};`}>
+	<section class="top-row">
+		<div>
+			<h1>{scenes[activeScene].title} Scene</h1>
+			<p>{scenes[activeScene].subtitle}</p>
+		</div>
+		<nav class="scene-nav" aria-label="Scene switcher">
+			{#each Object.keys(scenes) as sceneKey}
+				<button class:active={sceneKey === activeScene} style={sceneTagStyle(sceneKey)} on:click={() => switchScene(sceneKey)}>
+					{scenes[sceneKey].title}
 				</button>
 			{/each}
-		</div>
-	</main>
-{:else}
-	<main class="workspace" style={`--bgA:${palette.bgA};--bgB:${palette.bgB};--panel:${palette.panel};--bubble:${palette.bubble};--text:${palette.text};--soft:${palette.soft};`}>
-		<section class="top-row">
-			<div>
-				<h1>{scenes[activeScene].title} Scene</h1>
-				<p>{scenes[activeScene].subtitle}</p>
-			</div>
-			<nav class="scene-nav" aria-label="Scene switcher">
-				{#each Object.keys(scenes) as sceneKey}
-					<button class:active={sceneKey === activeScene} on:click={() => (activeScene = sceneKey)}>{scenes[sceneKey].title}</button>
-				{/each}
-			</nav>
-		</section>
+		</nav>
+	</section>
 
-		{#if scenes[activeScene].presets.length}
-			<section class="preset-panel">
-				<h2>Quick presets</h2>
-				<div class="preset-row">
-					{#each scenes[activeScene].presets as preset}
-						<button on:click={() => applyPreset(preset.mix)}>{preset.name}</button>
+	<section class="bubble-stage" bind:this={bubbleStageEl} on:wheel|preventDefault>
+		{#each bubbles as bubble}
+			{@const scale = 0.8 + bubble.volume * 0.65}
+			{@const opacity = 0.4 + bubble.volume * 0.6}
+			<article class="bubble-shell" style={`--scale:${scale};--opacity:${opacity};--drift:${bubble.drift}s;left:${bubble.x}%;top:${bubble.y}%;`}>
+				<button
+					class="bubble"
+					class:active={bubble.active}
+					on:pointerdown={(e) => startBubbleDrag(e, bubble)}
+					on:wheel|preventDefault={(e) => adjustVolumeWithWheel(e, bubble.id)}
+					aria-pressed={bubble.active}
+					aria-label={`${bubble.label}, ${Math.round(bubble.volume * 100)} percent volume`}
+				>
+					<span>{bubble.icon}</span>
+				</button>
+				<h3>{bubble.label}</h3>
+				<p>{Math.round(bubble.volume * 100)}%</p>
+			</article>
+		{/each}
+		<p class="bubble-hint">Drag to move, click to toggle, wheel to adjust volume.</p>
+	</section>
+
+	<section class="controls">
+		<div class="save-box">
+			<input type="text" bind:value={mixLabel} placeholder="Label this mix" maxlength="24" aria-label="Mix label" />
+			<button on:click={saveMix}>Save to Cabinet</button>
+		</div>
+		<button class="clear" on:click={clearAll}>Stop all ({activeCount})</button>
+	</section>
+
+	<aside class="drawer" class:closed={!drawerOpen}>
+		<button
+			class="drawer-toggle"
+			on:click={() => (drawerOpen = !drawerOpen)}
+			aria-label={drawerOpen ? 'Collapse cabinet drawer' : 'Expand cabinet drawer'}
+			title={drawerOpen ? 'Collapse cabinet drawer' : 'Expand cabinet drawer'}
+		>
+			{drawerOpen ? '>' : '<'}
+		</button>
+		<div class="drawer-inner">
+			<h2>Cabinet</h2>
+			<section class="cabinet-presets">
+				<h3>Preset Jars</h3>
+				<div class="jar-grid">
+					{#each presetJars as preset}
+						<button class="jar" style={jarToneStyle(preset.sceneKey)} on:click={() => handlePresetJarClick(preset)}>
+							<div class="lid"></div>
+							<div class="liquid" style={jarLiquidStyle(preset.mix)}></div>
+							<p>{preset.name}</p>
+						</button>
 					{/each}
 				</div>
 			</section>
-		{/if}
 
-		<section class="bubble-grid">
-			{#each bubbles as bubble}
-				{@const scale = 0.8 + bubble.volume * 0.65}
-				{@const opacity = 0.4 + bubble.volume * 0.6}
-				<article class="bubble-shell" style={`--scale:${scale};--opacity:${opacity};`}>
-					<button
-						class="bubble"
-						class:active={bubble.active}
-						on:pointerdown={(e) => startBubbleDrag(e, bubble.id, bubble.volume)}
-						on:click={() => toggleBubble(bubble.id)}
-						aria-pressed={bubble.active}
-					>
-						<span>{bubble.icon}</span>
-					</button>
-					<h3>{bubble.label}</h3>
-					<input type="range" min="0" max="1" step="0.01" value={bubble.volume} on:input={(e) => setVolume(bubble.id, e.currentTarget.value)} aria-label={`${bubble.label} volume`} />
-				</article>
-			{/each}
-		</section>
-
-		<section class="controls">
-			<div class="save-box">
-				<input type="text" bind:value={mixLabel} placeholder="Label this mix" maxlength="24" aria-label="Mix label" />
-				<button on:click={saveMix}>Save to Cabinet</button>
-			</div>
-			<button class="clear" on:click={clearAll}>Stop all ({activeCount})</button>
-		</section>
-
-		<aside class="drawer" class:closed={!drawerOpen}>
-			<button class="drawer-toggle" on:click={() => (drawerOpen = !drawerOpen)} aria-label="Toggle cabinet drawer">{drawerOpen ? '>' : '<'}</button>
-			<div class="drawer-inner">
-				<h2>Glass Jar Cabinet</h2>
-				{#if mixes.length === 0}
-					<p class="empty">No jars yet. Save your current mix.</p>
-				{:else}
+			{#if mixes.length === 0}
+				<p class="empty">No jars yet. Save your current mix.</p>
+			{:else}
+				<section class="cabinet-mixes">
+					<h3>Saved Mixes</h3>
 					<div class="jar-grid">
 						{#each mixes as jar}
-							<button class="jar" on:click={() => loadMix(jar)}>
+							<button
+								class="jar"
+								class:dragging={draggingMixId === jar.id}
+								style={jarToneStyle(jar.scene)}
+								on:pointerdown={(event) => startMixPointerDrag(event, jar.id)}
+								on:pointerenter={() => hoverMixTarget(jar.id)}
+								on:click={() => handleSavedJarClick(jar)}
+							>
 								<div class="lid"></div>
-								<div class="liquid" style={`--fill:${Math.max(15, Object.keys(jar.mix).length * 18)}%`}></div>
+								<div class="liquid" style={jarLiquidStyle(jar.mix)}></div>
 								<p>{jar.label}</p>
 							</button>
 						{/each}
 					</div>
-				{/if}
-			</div>
-		</aside>
-	</main>
-{/if}
+				</section>
+			{/if}
+		</div>
+	</aside>
+</main>
 
 <style>
+	:global(html),
+	:global(body) {
+		height: 100%;
+		overflow: hidden;
+	}
+
 	:global(body) {
 		margin: 0;
 		font-family: 'Avenir Next', 'Trebuchet MS', sans-serif;
@@ -407,14 +562,7 @@
 	}
 
 	main {
-		min-height: 100vh;
-	}
-
-	.entry-screen {
-		display: grid;
-		gap: 2rem;
-		padding: 5rem min(6vw, 4rem);
-		background: radial-gradient(circle at 20% 20%, #bcd0cb 0%, #9cb7c9 58%, #8ca0b4 100%);
+		height: 100dvh;
 	}
 
 	h1,
@@ -424,63 +572,22 @@
 		margin: 0;
 	}
 
-	.entry-screen h1 {
-		font-size: clamp(2rem, 4vw, 3.6rem);
-	}
-
-	.entry-screen p {
-		max-width: 46ch;
-		color: #f2f8fa;
-		line-height: 1.55;
-	}
-
-	.scene-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-		gap: 1rem;
-	}
-
-	.scene-card {
-		border: 1px solid rgba(255, 255, 255, 0.2);
-		border-radius: 1.25rem;
-		padding: 1.2rem;
-		text-align: left;
-		cursor: pointer;
-		background: linear-gradient(145deg, var(--bgA), var(--bgB));
-		color: var(--text);
-		min-height: 170px;
-		transition: transform 0.2s ease, box-shadow 0.2s ease;
-	}
-
-	.scene-card:hover {
-		transform: translateY(-4px);
-		box-shadow: 0 14px 30px rgba(0, 0, 0, 0.3);
-	}
-
-	.scene-card h2 {
-		font-size: 1.3rem;
-		margin-bottom: 0.45rem;
-	}
-
 	.workspace {
 		display: grid;
 		grid-template-columns: 1fr auto;
+		grid-template-rows: auto 1fr auto;
 		gap: 1.1rem;
 		padding: 1.2rem 1.2rem 1.2rem 1.6rem;
-		background: radial-gradient(circle at 10% 10%, var(--bgB) 0%, var(--bgA) 62%, #040507 100%);
+		background: radial-gradient(circle at 10% 10%, var(--bgB) 0%, var(--bgA) 62%, #c8b9ac 100%);
 		color: var(--text);
+		box-sizing: border-box;
+		overflow: hidden;
 	}
 
 	.top-row,
-	.preset-panel,
-	.bubble-grid,
 	.controls {
 		grid-column: 1 / 2;
-		background: var(--panel);
-		border: 1px solid rgba(255, 255, 255, 0.16);
-		border-radius: 1rem;
-		padding: 1rem;
-		backdrop-filter: blur(16px);
+		padding: 0.5rem 0.2rem;
 	}
 
 	.top-row {
@@ -502,39 +609,42 @@
 	}
 
 	.scene-nav button,
-	.preset-row button,
 	.save-box button,
 	.clear,
 	.drawer-toggle {
-		border: 1px solid rgba(255, 255, 255, 0.22);
+		border: 1px solid var(--tag-border, rgba(255, 255, 255, 0.4));
 		border-radius: 0.85rem;
-		background: rgba(255, 255, 255, 0.1);
-		color: var(--text);
+		background: color-mix(in srgb, var(--tag-bg, #ffffff) 70%, #ffffff 30%);
+		color: var(--tag-fg, var(--text));
 		padding: 0.5rem 0.8rem;
 		cursor: pointer;
 	}
 
 	.scene-nav button.active {
-		background: rgba(255, 255, 255, 0.27);
+		box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.7);
 	}
 
-	.preset-row {
-		display: flex;
-		gap: 0.5rem;
-		flex-wrap: wrap;
-		margin-top: 0.65rem;
-	}
-
-	.bubble-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-		gap: 1rem;
+	.bubble-stage {
+		grid-column: 1 / 2;
+		position: relative;
+		min-height: clamp(420px, 66vh, 760px);
+		border-radius: 1.15rem;
+		overflow: hidden;
+		background:
+			radial-gradient(circle at 20% 18%, rgba(255, 255, 255, 0.28), transparent 46%),
+			radial-gradient(circle at 82% 84%, rgba(255, 255, 255, 0.22), transparent 40%),
+			linear-gradient(165deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.05));
+		backdrop-filter: blur(10px);
 	}
 
 	.bubble-shell {
+		position: absolute;
+		transform: translate(-50%, -50%);
 		display: grid;
 		justify-items: center;
-		gap: 0.5rem;
+		gap: 0.4rem;
+		animation: float 7s ease-in-out infinite;
+		animation-delay: calc(var(--drift) * -1s);
 	}
 
 	.bubble {
@@ -543,18 +653,36 @@
 		border: none;
 		border-radius: 50%;
 		background: color-mix(in srgb, var(--bubble) 86%, #ffffff 14%);
-		color: #122;
+		color: #5a4f45;
 		font-weight: 700;
 		font-size: 1.1rem;
 		opacity: var(--opacity);
-		transform: scale(var(--scale));
+		transform: scale(var(--scale)) translateZ(0);
 		cursor: grab;
 		position: relative;
 		transition: transform 0.15s linear, opacity 0.15s linear, box-shadow 0.18s ease;
+		touch-action: none;
+		user-select: none;
+		isolation: isolate;
+	}
+
+	.bubble::after {
+		content: '';
+		position: absolute;
+		left: 50%;
+		top: 50%;
+		width: 100%;
+		height: 100%;
+		border-radius: 50%;
+		transform: translate(-50%, -50%) scale(1);
+		background: radial-gradient(circle, color-mix(in srgb, var(--bubble) 52%, #fff 48%) 0%, transparent 68%);
+		opacity: 0;
+		pointer-events: none;
+		z-index: -1;
 	}
 
 	.bubble:active {
-		cursor: ns-resize;
+		cursor: grabbing;
 	}
 
 	.bubble.active {
@@ -563,6 +691,10 @@
 			0 0 16px color-mix(in srgb, var(--bubble) 65%, #fff 35%),
 			0 0 36px color-mix(in srgb, var(--bubble) 55%, #fff 45%);
 		animation: aura 2.2s ease-in-out infinite;
+	}
+
+	.bubble.active::after {
+		animation: aura-size 2.2s ease-in-out infinite;
 	}
 
 	@keyframes aura {
@@ -581,68 +713,170 @@
 		}
 	}
 
-	.bubble-shell h3 {
-		font-size: 0.95rem;
-		color: var(--soft);
+	@keyframes aura-size {
+		0%,
+		100% {
+			transform: translate(-50%, -50%) scale(1.05);
+			opacity: 0.38;
+		}
+		50% {
+			transform: translate(-50%, -50%) scale(1.34);
+			opacity: 0.14;
+		}
 	}
 
-	.bubble-shell input {
-		width: 100%;
+	.bubble-shell h3 {
+		font-size: 0.83rem;
+		color: var(--soft);
+		line-height: 1;
+	}
+
+	.bubble-shell p {
+		margin: 0;
+		font-size: 0.76rem;
+		color: var(--soft);
+		padding: 0.12rem 0.4rem;
+		background: rgba(255, 255, 255, 0.26);
+		border-radius: 999px;
+	}
+
+	.bubble-hint {
+		position: absolute;
+		left: 0.9rem;
+		bottom: 0.7rem;
+		margin: 0;
+		font-size: 0.8rem;
+		color: rgba(64, 57, 50, 0.72);
+	}
+
+	@keyframes float {
+		0%,
+		100% {
+			transform: translate(-50%, -50%) translateY(0);
+		}
+		50% {
+			transform: translate(-50%, -50%) translateY(-8px);
+		}
 	}
 
 	.controls {
 		display: flex;
 		justify-content: space-between;
-		gap: 0.8rem;
+		gap: 0.5rem;
 		flex-wrap: wrap;
+		padding-top: 0.2rem;
+		padding-bottom: 0.2rem;
 	}
 
 	.save-box {
 		display: flex;
-		gap: 0.5rem;
+		gap: 0.4rem;
 		flex-wrap: wrap;
 	}
 
 	.save-box input {
-		background: rgba(255, 255, 255, 0.12);
-		border: 1px solid rgba(255, 255, 255, 0.2);
+		background: rgba(255, 255, 255, 0.28);
+		border: 1px solid rgba(255, 255, 255, 0.44);
 		border-radius: 0.7rem;
-		padding: 0.48rem 0.72rem;
+		padding: 0.38rem 0.62rem;
 		color: var(--text);
 	}
 
 	.drawer {
+		grid-column: 2 / 3;
+		grid-row: 1 / -1;
+		align-self: stretch;
 		position: relative;
 		width: min(300px, 78vw);
-		background: rgba(10, 15, 24, 0.56);
-		border: 1px solid rgba(255, 255, 255, 0.16);
+		height: 100%;
+		background: rgba(244, 238, 229, 0.48);
+		border: 1px solid rgba(255, 255, 255, 0.42);
 		border-radius: 1rem;
 		overflow: hidden;
 		transition: width 0.25s ease;
 	}
 
 	.drawer.closed {
-		width: 2.8rem;
+		width: 2.6rem;
 	}
 
 	.drawer-toggle {
 		position: absolute;
-		left: 0.4rem;
-		top: 0.6rem;
-		z-index: 2;
-		background: rgba(255, 255, 255, 0.16);
+		left: 0.28rem;
+		top: 50%;
+		transform: translateY(-50%);
+		z-index: 5;
+		background: transparent;
+		border: none;
+		width: 0.8rem;
+		height: 1.6rem;
+		padding: 0;
+		border-radius: 0;
+		font-size: 0.86rem;
+		font-weight: 600;
+		color: rgba(88, 76, 65, 0.86);
+		transition: transform 0.18s ease, color 0.18s ease, opacity 0.18s ease;
+		opacity: 0.72;
+	}
+
+	.drawer-toggle:hover {
+		opacity: 1;
+		color: rgba(76, 66, 57, 0.98);
+		transform: translateY(-50%) scale(1.05);
+	}
+
+	.drawer-toggle:active {
+		transform: translateY(-50%) scale(0.94);
+	}
+
+	.drawer.closed .drawer-toggle {
+		animation: nudge 1.9s ease-in-out infinite;
+	}
+
+	@keyframes nudge {
+		0%,
+		100% {
+			transform: translateY(-50%) translateX(0);
+		}
+		50% {
+			transform: translateY(-50%) translateX(-2px);
+		}
 	}
 
 	.drawer-inner {
-		padding: 0.9rem 0.9rem 1rem 3.2rem;
+		padding: 0.9rem 0.9rem 1rem 1.35rem;
+		height: 100%;
+		box-sizing: border-box;
+		overflow-y: auto;
+		overflow-x: hidden;
+		overscroll-behavior: contain;
+		scrollbar-gutter: stable;
 	}
 
 	.drawer.closed .drawer-inner {
 		display: none;
 	}
 
+	.cabinet-presets {
+		margin-top: 0.7rem;
+		padding: 0.7rem;
+		border-radius: 0.9rem;
+		background: rgba(255, 255, 255, 0.22);
+		border: 1px solid rgba(255, 255, 255, 0.38);
+	}
+
+	.cabinet-presets h3,
+	.cabinet-mixes h3 {
+		font-size: 0.9rem;
+		color: #5b534a;
+	}
+
+	.cabinet-mixes {
+		margin-top: 0.9rem;
+	}
+
 	.empty {
-		color: #cad2dc;
+		color: #7a726a;
 		font-size: 0.9rem;
 		margin-top: 1rem;
 	}
@@ -655,19 +889,29 @@
 	}
 
 	.jar {
-		border: 1px solid rgba(255, 255, 255, 0.24);
+		border: 1px solid rgba(255, 255, 255, 0.48);
 		border-radius: 1rem;
 		padding: 0.6rem 0.5rem;
-		background: rgba(245, 254, 255, 0.08);
-		cursor: pointer;
-		color: #dceaf8;
+		background: rgba(255, 255, 255, 0.26);
+		cursor: grab;
+		color: #5e554c;
+		user-select: none;
+	}
+
+	.jar:active {
+		cursor: grabbing;
+	}
+
+	.jar.dragging {
+		opacity: 0.56;
+		transform: scale(0.97);
 	}
 
 	.lid {
 		width: 56%;
 		height: 9px;
 		margin: 0 auto;
-		background: linear-gradient(180deg, #8b9eb2, #5f6f7f);
+		background: linear-gradient(180deg, var(--lid-b, #8b9eb2), var(--lid-a, #5f6f7f));
 		border-radius: 0.4rem;
 	}
 
@@ -677,14 +921,14 @@
 		margin: 0.2rem auto 0.4rem;
 		width: 72%;
 		border-radius: 0.85rem;
-		border: 1px solid rgba(202, 226, 255, 0.45);
+		border: 1px solid color-mix(in srgb, var(--jar, #d8cfc4) 56%, #ffffff 44%);
 		background: linear-gradient(
 			180deg,
-			rgba(206, 236, 255, 0.08) 0%,
-			rgba(133, 203, 255, 0.14) calc(100% - var(--fill)),
-			rgba(126, 177, 240, 0.42) 100%
+			rgba(255, 255, 255, 0.22) 0%,
+			color-mix(in srgb, var(--jar, #d8cfc4) 34%, #ffffff 66%) calc(100% - var(--fill)),
+			color-mix(in srgb, var(--jar-glow, #b9aca0) 74%, #ffffff 26%) 100%
 		);
-		box-shadow: inset 0 0 14px rgba(167, 217, 255, 0.22);
+		box-shadow: inset 0 0 14px color-mix(in srgb, var(--jar, #d8cfc4) 40%, #ffffff 60%);
 	}
 
 	.jar p {
@@ -695,10 +939,12 @@
 	@media (max-width: 900px) {
 		.workspace {
 			grid-template-columns: 1fr;
+			grid-template-rows: auto 1fr auto auto;
 		}
 
 		.drawer {
-			grid-row: 6;
+			grid-column: 1 / 2;
+			grid-row: 4;
 			width: 100%;
 		}
 
@@ -710,6 +956,16 @@
 		.drawer-toggle {
 			left: auto;
 			right: 0.5rem;
+			top: 50%;
+		}
+
+		.bubble-stage {
+			min-height: 68vh;
+		}
+
+		.bubble {
+			width: 74px;
+			height: 74px;
 		}
 	}
 </style>
