@@ -1,6 +1,7 @@
 <script>
 	import { browser } from '$app/environment';
 	import { onDestroy, onMount } from 'svelte';
+	import Matter from 'matter-js';
 
 	const bubbleDefs = [
 		{ id: 'rain', label: 'Rain', icon: 'R' },
@@ -20,70 +21,57 @@
 		{ x: 24, y: 44 }
 	];
 
-	const scenes = {
-		sleep: {
-			title: 'Sleep',
-			subtitle: 'Settle into gentle, slower textures.',
-			colors: {
-				bgA: '#b8c6d2',
-				bgB: '#d6e0e8',
-				panel: 'rgba(247, 244, 238, 0.62)',
-				bubble: '#efe5d9',
-				text: '#4d4740',
-				soft: '#776f66'
-			},
-			presets: [
-				{ name: 'Moon Drift', mix: { rain: 0.65, ocean: 0.3, night: 0.45 } },
-				{ name: 'Deep Nest', mix: { wind: 0.35, static: 0.2, night: 0.55 } },
-				{ name: 'Cloud Blanket', mix: { rain: 0.45, wind: 0.2, ocean: 0.25 } }
-			]
-		},
-		focus: {
-			title: 'Focus',
-			subtitle: 'Clear distractions with stable, low-variation layers.',
-			colors: {
-				bgA: '#bdcdbf',
-				bgB: '#dbe6d9',
-				panel: 'rgba(248, 245, 239, 0.62)',
-				bubble: '#f0e8db',
-				text: '#4d4941',
-				soft: '#787268'
-			},
-			presets: [
-				{ name: 'Green Signal', mix: { static: 0.4, wind: 0.25, rain: 0.2 } },
-				{ name: 'Quiet Grid', mix: { ocean: 0.35, static: 0.35 } },
-				{ name: 'Single Channel', mix: { wind: 0.45, birds: 0.15, static: 0.2 } }
-			]
-		},
-		customization: {
-			title: 'Customization',
-			subtitle: 'Build your own calm blend from scratch.',
-			colors: {
-				bgA: '#d2bfb2',
-				bgB: '#e9d9cf',
-				panel: 'rgba(249, 245, 240, 0.62)',
-				bubble: '#f3e8dc',
-				text: '#4f4741',
-				soft: '#7a7068'
-			},
-			presets: []
+	const calmScene = {
+		title: 'Calm',
+		subtitle: 'Blend and shape your sound bubbles freely.',
+		colors: {
+			bgA: '#0d2045',
+			bgB: '#1e3f78',
+			panel: 'rgba(146, 186, 255, 0.08)',
+			bubble: '#9dccff',
+			text: '#dbe9ff',
+			soft: '#9db8e2'
 		}
 	};
 
-	let activeScene = 'sleep';
 	let drawerOpen = true;
 	let mixes = [];
 	let mixLabel = '';
 
 	let audioCtx;
-	const engines = new Map();
+	let physicsEngine;
+	let physicsRunner;
+	let wallBodies = [];
+	const bubbleBodies = new Map();
+	let nextBubbleUid = 1;
 	let bubbles = bubbleDefs.map((b, i) => ({
-		...b,
+		uid: nextBubbleUid++,
+		label: b.label,
+		icon: b.icon,
+		sourceType: b.id,
+		components: [b.id],
 		active: false,
 		volume: 0.45,
-		x: bubbleSeeds[i].x,
-		y: bubbleSeeds[i].y,
-		drift: (i % 3) * 1.15
+		seedX: bubbleSeeds[i].x,
+		seedY: bubbleSeeds[i].y,
+		x: null,
+		y: null,
+		radius: 42,
+		mass: 42 * 42,
+		pulseFrequency: 0.09 + (i % 4) * 0.015,
+		audioSource: null,
+		gainNode: null,
+		engine: null,
+		fusing: false,
+		separating: false,
+		noFuseUntil: 0,
+		fusionScale: 1,
+		fusionOpacity: 1,
+		drift: (i % 3) * 1.15,
+		vx: 0,
+		vy: 0,
+		ax: 0,
+		ay: 0
 	}));
 
 	let dragState = null;
@@ -92,23 +80,244 @@
 	let mixPointerDrag = null;
 	let suppressJarClick = false;
 	let activeJarKey = null;
+	let rafId = null;
+	let fusionAnimations = [];
+	let separationAnimations = [];
+	let clock = 0;
+	let lastFrameMs = 0;
 
-	const presetJars = Object.entries(scenes).flatMap(([sceneKey, scene]) =>
-		scene.presets.map((preset) => ({ ...preset, sceneKey }))
-	);
+	const labelBySource = Object.fromEntries(bubbleDefs.map((item) => [item.id, item.label]));
 
-	$: palette = scenes[activeScene].colors;
+	$: palette = calmScene.colors;
 	$: activeCount = bubbles.filter((b) => b.active).length;
 
+	function initPhysics() {
+		if (!bubbleStageEl) return;
+		physicsEngine = Matter.Engine.create({ gravity: { x: 0, y: 0 } });
+		physicsRunner = Matter.Runner.create();
+		rebuildWalls();
+		Matter.Runner.run(physicsRunner, physicsEngine);
+	}
+
+	function destroyPhysics() {
+		if (!physicsEngine) return;
+		for (const body of bubbleBodies.values()) {
+			Matter.World.remove(physicsEngine.world, body);
+		}
+		bubbleBodies.clear();
+		for (const wall of wallBodies) {
+			Matter.World.remove(physicsEngine.world, wall);
+		}
+		wallBodies = [];
+		if (physicsRunner) Matter.Runner.stop(physicsRunner);
+		physicsRunner = null;
+		physicsEngine = null;
+	}
+
+	function rebuildWalls() {
+		if (!physicsEngine || !bubbleStageEl) return;
+		for (const wall of wallBodies) Matter.World.remove(physicsEngine.world, wall);
+		wallBodies = [];
+		const rect = bubbleStageEl.getBoundingClientRect();
+		const thickness = 80;
+		wallBodies = [
+			Matter.Bodies.rectangle(rect.width / 2, -thickness / 2, rect.width + thickness * 2, thickness, {
+				isStatic: true
+			}),
+			Matter.Bodies.rectangle(rect.width / 2, rect.height + thickness / 2, rect.width + thickness * 2, thickness, {
+				isStatic: true
+			}),
+			Matter.Bodies.rectangle(-thickness / 2, rect.height / 2, thickness, rect.height + thickness * 2, {
+				isStatic: true
+			}),
+			Matter.Bodies.rectangle(rect.width + thickness / 2, rect.height / 2, thickness, rect.height + thickness * 2, {
+				isStatic: true
+			})
+		];
+		Matter.World.add(physicsEngine.world, wallBodies);
+	}
+
+	function attachBody(bubble) {
+		if (!physicsEngine || bubbleBodies.has(bubble.uid) || bubble.x === null || bubble.y === null) return;
+		const body = Matter.Bodies.circle(bubble.x, bubble.y, bubble.radius, {
+			restitution: 0.22,
+			frictionAir: 0.045,
+			friction: 0.02,
+			frictionStatic: 0.05,
+			density: 0.0011
+		});
+		body.label = `bubble:${bubble.uid}`;
+		bubbleBodies.set(bubble.uid, body);
+		Matter.World.add(physicsEngine.world, body);
+	}
+
+	function detachBody(uid) {
+		const body = bubbleBodies.get(uid);
+		if (!body || !physicsEngine) return;
+		Matter.World.remove(physicsEngine.world, body);
+		bubbleBodies.delete(uid);
+	}
+
+	function syncBodies() {
+		if (!physicsEngine) return false;
+		let changed = false;
+		const alive = new Set(bubbles.map((b) => b.uid));
+		for (const uid of bubbleBodies.keys()) {
+			if (!alive.has(uid)) detachBody(uid);
+		}
+		for (const bubble of bubbles) {
+			if (bubble.fusing || bubble.separating) {
+				detachBody(bubble.uid);
+				continue;
+			}
+			attachBody(bubble);
+			const body = bubbleBodies.get(bubble.uid);
+			if (!body) continue;
+			const dx = body.position.x - bubble.x;
+			const dy = body.position.y - bubble.y;
+			const vx = body.velocity.x;
+			const vy = body.velocity.y;
+			const ax = (vx - (bubble.vx ?? 0)) * 60;
+			const ay = (vy - (bubble.vy ?? 0)) * 60;
+			if (
+				Math.abs(dx) > 0.01 ||
+				Math.abs(dy) > 0.01 ||
+				Math.abs(vx - (bubble.vx ?? 0)) > 0.001 ||
+				Math.abs(vy - (bubble.vy ?? 0)) > 0.001
+			) {
+				bubble.x = body.position.x;
+				bubble.y = body.position.y;
+				bubble.vx = vx;
+				bubble.vy = vy;
+				bubble.ax = ax;
+				bubble.ay = ay;
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	function applyDragForce(dt) {
+		if (!dragState || !physicsEngine) return false;
+		const bubble = bubbles.find((candidate) => candidate.uid === dragState.uid);
+		const body = bubble ? bubbleBodies.get(bubble.uid) : null;
+		if (!bubble || !body) return false;
+		const k = 0.00062 + bubble.mass * 0.00000006;
+		const damping = 0.17;
+		const dx = dragState.targetX - body.position.x;
+		const dy = dragState.targetY - body.position.y;
+		const fx = dx * k - body.velocity.x * damping;
+		const fy = dy * k - body.velocity.y * damping;
+		Matter.Body.applyForce(body, body.position, { x: fx * dt, y: fy * dt });
+		return Math.abs(dx) > 0.05 || Math.abs(dy) > 0.05;
+	}
+
+	function applyPairAttraction(dt, nowMs) {
+		if (!physicsEngine) return false;
+		let changed = false;
+		for (let i = 0; i < bubbles.length; i += 1) {
+			for (let j = i + 1; j < bubbles.length; j += 1) {
+				const a = bubbles[i];
+				const b = bubbles[j];
+				if (a.fusing || b.fusing || a.separating || b.separating || nowMs < a.noFuseUntil || nowMs < b.noFuseUntil) {
+					continue;
+				}
+				const bodyA = bubbleBodies.get(a.uid);
+				const bodyB = bubbleBodies.get(b.uid);
+				if (!bodyA || !bodyB) continue;
+				const dx = bodyB.position.x - bodyA.position.x;
+				const dy = bodyB.position.y - bodyA.position.y;
+				const distance = Math.hypot(dx, dy) || 1;
+				const minGap = a.radius + b.radius + 8;
+				const interactionRange = (a.radius + b.radius) * 1.45;
+				if (distance > interactionRange || distance < 1) continue;
+				const nx = dx / distance;
+				const ny = dy / distance;
+
+				// Keep a minimum gap so attraction never causes visible overlap.
+				if (distance <= minGap) {
+					const repel = (minGap - distance) * 0.00001 * dt;
+					Matter.Body.applyForce(bodyA, bodyA.position, { x: -nx * repel, y: -ny * repel });
+					Matter.Body.applyForce(bodyB, bodyB.position, { x: nx * repel, y: ny * repel });
+					changed = true;
+					continue;
+				}
+
+				const pull = 1 - distance / interactionRange;
+				const forceMag = pull * 0.0000026 * Math.sqrt(a.mass * b.mass);
+				const force = { x: nx * forceMag * dt, y: ny * forceMag * dt };
+				Matter.Body.applyForce(bodyA, bodyA.position, force);
+				Matter.Body.applyForce(bodyB, bodyB.position, { x: -force.x, y: -force.y });
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	function containBodies() {
+		if (!bubbleStageEl) return false;
+		const width = bubbleStageEl.clientWidth;
+		const height = bubbleStageEl.clientHeight;
+		let changed = false;
+		for (const bubble of bubbles) {
+			const body = bubbleBodies.get(bubble.uid);
+			if (!body) continue;
+			let bodyChanged = false;
+			const r = bubble.radius;
+			let x = body.position.x;
+			let y = body.position.y;
+			let vx = body.velocity.x;
+			let vy = body.velocity.y;
+
+			// Keep bodies inside stage bounds to prevent tunneling through walls at high speed.
+			if (x < r) {
+				x = r;
+				vx = Math.max(0, Math.abs(vx) * 0.18);
+				bodyChanged = true;
+			} else if (x > width - r) {
+				x = width - r;
+				vx = -Math.max(0, Math.abs(vx) * 0.18);
+				bodyChanged = true;
+			}
+			if (y < r) {
+				y = r;
+				vy = Math.max(0, Math.abs(vy) * 0.18);
+				bodyChanged = true;
+			} else if (y > height - r) {
+				y = height - r;
+				vy = -Math.max(0, Math.abs(vy) * 0.18);
+				bodyChanged = true;
+			}
+
+			const speed = Math.hypot(vx, vy);
+			const maxSpeed = 4.6;
+			if (speed > maxSpeed) {
+				const ratio = maxSpeed / speed;
+				vx *= ratio;
+				vy *= ratio;
+				bodyChanged = true;
+			}
+
+			if (bodyChanged) {
+				Matter.Body.setPosition(body, { x, y });
+				Matter.Body.setVelocity(body, { x: vx, y: vy });
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
 	function destroyAllEngines() {
-		for (const [, engine] of engines) {
+		for (const bubble of bubbles) {
 			try {
-				engine.dispose();
+				bubble.engine?.dispose();
 			} catch {
 				// best effort
 			}
+			bubble.engine = null;
+			bubble.audioSource = null;
+			bubble.gainNode = null;
 		}
-		engines.clear();
 	}
 
 	async function hardStopAudio() {
@@ -132,9 +341,27 @@
 				mixes = [];
 			}
 		}
+
+		const start = () => {
+			seedBubblePositions();
+			initPhysics();
+			syncBodies();
+			rafId = requestAnimationFrame(runFusionLoop);
+		};
+		setTimeout(start, 0);
+
+		const onResize = () => {
+			rebuildWalls();
+		};
+		window.addEventListener('resize', onResize);
+		return () => {
+			window.removeEventListener('resize', onResize);
+		};
 	});
 
 	onDestroy(() => {
+		if (rafId) cancelAnimationFrame(rafId);
+		destroyPhysics();
 		void hardStopAudio();
 	});
 
@@ -148,23 +375,25 @@
 	}
 
 	function createNoiseEngine(type) {
-		const gain = new GainNode(audioCtx, { gain: 0 });
+		const gainNode = new GainNode(audioCtx, { gain: 0 });
 		let source;
 		let modOsc;
 		let modGain;
 		let swellGain;
 		let interval;
+		let chirpBus;
 
 		if (type === 'birds') {
-			gain.connect(audioCtx.destination);
+			chirpBus = new GainNode(audioCtx, { gain: 1 });
+			chirpBus.connect(gainNode).connect(audioCtx.destination);
 			interval = setInterval(() => {
-				if (gain.gain.value <= 0.001) return;
+				if (gainNode.gain.value <= 0.001) return;
 				const osc = new OscillatorNode(audioCtx, {
 					type: 'triangle',
 					frequency: 1150 + Math.random() * 500
 				});
 				const chirpGain = new GainNode(audioCtx, { gain: 0 });
-				osc.connect(chirpGain).connect(gain);
+				osc.connect(chirpGain).connect(chirpBus);
 				const now = audioCtx.currentTime;
 				chirpGain.gain.setValueAtTime(0, now);
 				chirpGain.gain.linearRampToValueAtTime(0.16, now + 0.03);
@@ -175,12 +404,21 @@
 			}, 900);
 
 			return {
+				sourceNode: chirpBus,
+				gainNode,
 				setVolume(v) {
-					gain.gain.setTargetAtTime(v, audioCtx.currentTime, 0.08);
+					gainNode.gain.setTargetAtTime(v, audioCtx.currentTime, 0.08);
+				},
+				fadeTo(v, seconds = 0.7) {
+					const now = audioCtx.currentTime;
+					gainNode.gain.cancelScheduledValues(now);
+					gainNode.gain.setValueAtTime(gainNode.gain.value, now);
+					gainNode.gain.linearRampToValueAtTime(v, now + seconds);
 				},
 				dispose() {
 					clearInterval(interval);
-					gain.disconnect();
+					chirpBus.disconnect();
+					gainNode.disconnect();
 				}
 			};
 		}
@@ -216,15 +454,23 @@
 		}
 
 		if (type === 'ocean') {
-			source.connect(filter).connect(swellGain).connect(gain).connect(audioCtx.destination);
+			source.connect(filter).connect(swellGain).connect(gainNode).connect(audioCtx.destination);
 		} else {
-			source.connect(filter).connect(gain).connect(audioCtx.destination);
+			source.connect(filter).connect(gainNode).connect(audioCtx.destination);
 		}
 		source.start();
 
 		return {
+			sourceNode: source,
+			gainNode,
 			setVolume(v) {
-				gain.gain.setTargetAtTime(v, audioCtx.currentTime, 0.08);
+				gainNode.gain.setTargetAtTime(v, audioCtx.currentTime, 0.08);
+			},
+			fadeTo(v, seconds = 0.7) {
+				const now = audioCtx.currentTime;
+				gainNode.gain.cancelScheduledValues(now);
+				gainNode.gain.setValueAtTime(gainNode.gain.value, now);
+				gainNode.gain.linearRampToValueAtTime(v, now + seconds);
 			},
 			dispose() {
 				if (modOsc) {
@@ -236,66 +482,418 @@
 				source.stop();
 				source.disconnect();
 				filter.disconnect();
-				gain.disconnect();
+				gainNode.disconnect();
 			}
 		};
 	}
 
-	function updateEngineVolume(id, active, volume) {
-		if (!audioCtx) return;
-		if (!active) {
-			engines.get(id)?.dispose();
-			engines.delete(id);
+	function seedBubblePositions() {
+		if (!bubbleStageEl) return;
+		const rect = bubbleStageEl.getBoundingClientRect();
+		bubbles = bubbles.map((bubble) => {
+			if (bubble.x !== null && bubble.y !== null) return bubble;
+			return {
+				...bubble,
+				x: (bubble.seedX / 100) * rect.width,
+				y: (bubble.seedY / 100) * rect.height
+			};
+		});
+	}
+
+	function attachEngineToBubble(bubble, engine) {
+		bubble.engine = engine;
+		bubble.audioSource = engine.sourceNode;
+		bubble.gainNode = engine.gainNode;
+	}
+
+	function ensureBubbleEngine(bubble) {
+		if (bubble.engine) return;
+		ensureContext();
+		const engine = createNoiseEngine(bubble.sourceType.split('+')[0]);
+		attachEngineToBubble(bubble, engine);
+	}
+
+	function updateBubbleAudio(bubble, useFadeSeconds = 0.08) {
+		if (!bubble.active) {
+			if (bubble.engine) {
+				bubble.engine.dispose();
+				bubble.engine = null;
+				bubble.audioSource = null;
+				bubble.gainNode = null;
+			}
 			return;
 		}
-		if (!engines.has(id)) {
-			engines.set(id, createNoiseEngine(id));
+		ensureBubbleEngine(bubble);
+		if (bubble.engine?.fadeTo) {
+			bubble.engine.fadeTo(bubble.volume * 0.35, useFadeSeconds);
 		}
-		engines.get(id)?.setVolume(volume * 0.35);
 	}
 
-	function toggleBubble(id) {
+	function toggleBubble(uid) {
 		ensureContext();
 		bubbles = bubbles.map((bubble) => {
-			if (bubble.id !== id) return bubble;
+			if (bubble.uid !== uid) return bubble;
 			const next = { ...bubble, active: !bubble.active };
-			updateEngineVolume(next.id, next.active, next.volume);
+			updateBubbleAudio(next);
 			return next;
 		});
 	}
 
-	function setVolume(id, rawValue) {
+	function setVolume(uid, rawValue) {
 		const value = Math.max(0, Math.min(1, Number(rawValue)));
 		bubbles = bubbles.map((bubble) => {
-			if (bubble.id !== id) return bubble;
+			if (bubble.uid !== uid) return bubble;
 			const next = { ...bubble, volume: value };
-			if (next.active) {
-				ensureContext();
-				updateEngineVolume(next.id, true, next.volume);
-			}
+			updateBubbleAudio(next);
 			return next;
 		});
 	}
 
-	function applyPreset(mix) {
+	function applyMix(mix) {
 		ensureContext();
 		bubbles = bubbles.map((bubble) => {
-			const value = mix[bubble.id] ?? 0;
+			const value = mix[bubble.sourceType] ?? 0;
 			const next = { ...bubble, volume: value || bubble.volume, active: value > 0 };
-			updateEngineVolume(next.id, next.active, next.volume);
+			updateBubbleAudio(next);
 			return next;
 		});
+	}
+
+	function circleOverlapRatio(a, b) {
+		const dx = b.x - a.x;
+		const dy = b.y - a.y;
+		const d = Math.hypot(dx, dy);
+		const r1 = a.radius;
+		const r2 = b.radius;
+		if (d >= r1 + r2) return 0;
+		if (d <= Math.abs(r1 - r2)) return 1;
+
+		const r1Sq = r1 * r1;
+		const r2Sq = r2 * r2;
+		const alpha = Math.acos((d * d + r1Sq - r2Sq) / (2 * d * r1));
+		const beta = Math.acos((d * d + r2Sq - r1Sq) / (2 * d * r2));
+		const overlap =
+			r1Sq * alpha +
+			r2Sq * beta -
+			0.5 * Math.sqrt((-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2));
+		const minArea = Math.PI * Math.min(r1Sq, r2Sq);
+		return overlap / minArea;
+	}
+
+	function easeInOutCubic(t) {
+		return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+	}
+
+	function formatBubbleLabel(components) {
+		if (!components?.length) return 'Blend';
+		if (components.length === 1) return labelBySource[components[0]] ?? components[0];
+		return `Blend ${components.length}`;
+	}
+
+	function startFusion(a, b, nowMs) {
+		if (!a || !b || a.fusing || b.fusing) return false;
+		const duration = 600 + Math.random() * 200;
+		const midX = (a.x + b.x) / 2;
+		const midY = (a.y + b.y) / 2;
+		const newMass = a.mass + b.mass;
+		const newRadius = Math.sqrt(newMass);
+		const newPulseFrequency = (a.pulseFrequency * a.mass + b.pulseFrequency * b.mass) / newMass;
+		const mergedVolume = (a.volume * a.mass + b.volume * b.mass) / newMass;
+		const dominantSource = a.mass >= b.mass ? a.sourceType : b.sourceType;
+
+		a.fusing = true;
+		b.fusing = true;
+
+		const mergedBubble = {
+			uid: nextBubbleUid++,
+			label: formatBubbleLabel([...a.components, ...b.components]),
+			icon: '●',
+			sourceType: dominantSource,
+			components: [...a.components, ...b.components],
+			active: a.active || b.active,
+			volume: mergedVolume,
+			seedX: 0,
+			seedY: 0,
+			x: midX,
+			y: midY,
+			radius: newRadius,
+			mass: newMass,
+			pulseFrequency: newPulseFrequency,
+			audioSource: null,
+			gainNode: null,
+			engine: null,
+			fusing: false,
+			separating: false,
+			noFuseUntil: 0,
+			fusionScale: 1,
+			fusionOpacity: 1,
+			drift: ((a.drift ?? 0) + (b.drift ?? 0)) / 2,
+			vx: 0,
+			vy: 0,
+			ax: 0,
+			ay: 0
+		};
+
+		if (mergedBubble.active) {
+			ensureBubbleEngine(mergedBubble);
+			mergedBubble.engine?.fadeTo(mergedBubble.volume * 0.35, duration / 1000);
+		}
+		a.engine?.fadeTo(0, duration / 1000);
+		b.engine?.fadeTo(0, duration / 1000);
+
+		fusionAnimations.push({
+			aUid: a.uid,
+			bUid: b.uid,
+			startMs: nowMs,
+			durationMs: duration,
+			startAX: a.x,
+			startAY: a.y,
+			startBX: b.x,
+			startBY: b.y,
+			midX,
+			midY,
+			mergedBubble
+		});
+		return true;
+	}
+
+	function advanceFusionAnimations(nowMs) {
+		let changed = false;
+		const completed = [];
+		for (const anim of fusionAnimations) {
+			const a = bubbles.find((bubble) => bubble.uid === anim.aUid);
+			const b = bubbles.find((bubble) => bubble.uid === anim.bUid);
+			if (!a || !b) {
+				completed.push(anim);
+				continue;
+			}
+			const raw = Math.min(1, (nowMs - anim.startMs) / anim.durationMs);
+			const eased = easeInOutCubic(raw);
+			a.x = anim.startAX + (anim.midX - anim.startAX) * eased;
+			a.y = anim.startAY + (anim.midY - anim.startAY) * eased;
+			b.x = anim.startBX + (anim.midX - anim.startBX) * eased;
+			b.y = anim.startBY + (anim.midY - anim.startBY) * eased;
+			a.fusionScale = 1 - 0.35 * eased;
+			b.fusionScale = 1 - 0.35 * eased;
+			a.fusionOpacity = 1 - 0.7 * eased;
+			b.fusionOpacity = 1 - 0.7 * eased;
+			changed = true;
+			if (raw >= 1) completed.push(anim);
+		}
+
+		for (const anim of completed) {
+			const oldA = bubbles.find((bubble) => bubble.uid === anim.aUid);
+			const oldB = bubbles.find((bubble) => bubble.uid === anim.bUid);
+			oldA?.engine?.dispose();
+			oldB?.engine?.dispose();
+			bubbles = bubbles.filter((bubble) => bubble.uid !== anim.aUid && bubble.uid !== anim.bUid);
+			bubbles = [...bubbles, anim.mergedBubble];
+			fusionAnimations = fusionAnimations.filter((candidate) => candidate !== anim);
+			changed = true;
+		}
+		return changed;
+	}
+
+	function startSeparation(parent, nowMs) {
+		if (!parent || parent.fusing || parent.separating) return false;
+		const canSplit = parent.components.length > 1;
+		if (!canSplit) return false;
+
+		const duration = 520 + Math.random() * 140;
+		const massA = parent.mass * 0.5;
+		const massB = parent.mass - massA;
+		const radiusA = Math.sqrt(massA);
+		const radiusB = Math.sqrt(massB);
+		const angle = Math.random() * Math.PI * 2;
+		const offset = Math.min(62, Math.max(40, parent.radius * 0.68));
+		const minSafeDistance = radiusA + radiusB + 12;
+		const launchDistance = Math.max(offset * 2, minSafeDistance);
+		const targetAX = parent.x + Math.cos(angle) * (launchDistance / 2);
+		const targetAY = parent.y + Math.sin(angle) * (launchDistance / 2);
+		const targetBX = parent.x - Math.cos(angle) * (launchDistance / 2);
+		const targetBY = parent.y - Math.sin(angle) * (launchDistance / 2);
+		const noFuseUntil = nowMs + duration + 450;
+
+		const splitAt = 1;
+		const compA = parent.components.slice(0, splitAt);
+		const compB = parent.components.slice(splitAt);
+		if (!compA.length || !compB.length) return false;
+		const srcA = compA[0] ?? parent.sourceType;
+		const srcB = compB[0] ?? parent.sourceType;
+
+		const childA = {
+			uid: nextBubbleUid++,
+			label: formatBubbleLabel(compA),
+			icon: '◍',
+			sourceType: srcA,
+			components: compA.length ? compA : [srcA],
+			active: parent.active,
+			volume: parent.volume,
+			seedX: 0,
+			seedY: 0,
+			x: parent.x,
+			y: parent.y,
+			radius: radiusA,
+			mass: massA,
+			pulseFrequency: Math.max(0.04, parent.pulseFrequency * 0.92),
+			audioSource: null,
+			gainNode: null,
+			engine: null,
+			fusing: false,
+			separating: true,
+			noFuseUntil,
+			fusionScale: 0.88,
+			fusionOpacity: 0,
+			drift: parent.drift - 0.4,
+			vx: 0,
+			vy: 0,
+			ax: 0,
+			ay: 0
+		};
+
+		const childB = {
+			uid: nextBubbleUid++,
+			label: formatBubbleLabel(compB),
+			icon: '◍',
+			sourceType: srcB,
+			components: compB.length ? compB : [srcB],
+			active: parent.active,
+			volume: parent.volume,
+			seedX: 0,
+			seedY: 0,
+			x: parent.x,
+			y: parent.y,
+			radius: radiusB,
+			mass: massB,
+			pulseFrequency: parent.pulseFrequency * 1.08,
+			audioSource: null,
+			gainNode: null,
+			engine: null,
+			fusing: false,
+			separating: true,
+			noFuseUntil,
+			fusionScale: 0.88,
+			fusionOpacity: 0,
+			drift: parent.drift + 0.4,
+			vx: 0,
+			vy: 0,
+			ax: 0,
+			ay: 0
+		};
+
+		parent.separating = true;
+
+		if (parent.active) {
+			ensureBubbleEngine(childA);
+			ensureBubbleEngine(childB);
+			childA.engine?.fadeTo(childA.volume * 0.2, duration / 1000);
+			childB.engine?.fadeTo(childB.volume * 0.2, duration / 1000);
+			parent.engine?.fadeTo(0, duration / 1000);
+		}
+
+		bubbles = [...bubbles, childA, childB];
+		separationAnimations.push({
+			parentUid: parent.uid,
+			childAUid: childA.uid,
+			childBUid: childB.uid,
+			startMs: nowMs,
+			durationMs: duration,
+			startX: parent.x,
+			startY: parent.y,
+			targetAX,
+			targetAY,
+			targetBX,
+			targetBY
+		});
+		return true;
+	}
+
+	function advanceSeparationAnimations(nowMs) {
+		let changed = false;
+		const completed = [];
+		for (const anim of separationAnimations) {
+			const parent = bubbles.find((bubble) => bubble.uid === anim.parentUid);
+			const childA = bubbles.find((bubble) => bubble.uid === anim.childAUid);
+			const childB = bubbles.find((bubble) => bubble.uid === anim.childBUid);
+			if (!parent || !childA || !childB) {
+				completed.push(anim);
+				continue;
+			}
+			const raw = Math.min(1, (nowMs - anim.startMs) / anim.durationMs);
+			const eased = easeInOutCubic(raw);
+			childA.x = anim.startX + (anim.targetAX - anim.startX) * eased;
+			childA.y = anim.startY + (anim.targetAY - anim.startY) * eased;
+			childB.x = anim.startX + (anim.targetBX - anim.startX) * eased;
+			childB.y = anim.startY + (anim.targetBY - anim.startY) * eased;
+			childA.fusionOpacity = eased;
+			childB.fusionOpacity = eased;
+			childA.fusionScale = 0.88 + 0.12 * eased;
+			childB.fusionScale = 0.88 + 0.12 * eased;
+			parent.fusionScale = 1 - 0.22 * eased;
+			parent.fusionOpacity = 1 - eased;
+			changed = true;
+			if (raw >= 1) completed.push(anim);
+		}
+
+		for (const anim of completed) {
+			const parent = bubbles.find((bubble) => bubble.uid === anim.parentUid);
+			parent?.engine?.dispose();
+			bubbles = bubbles.filter((bubble) => bubble.uid !== anim.parentUid);
+			bubbles = bubbles.map((bubble) =>
+				bubble.uid === anim.childAUid || bubble.uid === anim.childBUid
+					? { ...bubble, separating: false, fusionScale: 1, fusionOpacity: 1 }
+					: bubble
+			);
+			separationAnimations = separationAnimations.filter((candidate) => candidate !== anim);
+			changed = true;
+		}
+		return changed;
+	}
+
+	function detectFusion(nowMs) {
+		if (fusionAnimations.length) return false;
+		for (let i = 0; i < bubbles.length; i += 1) {
+			for (let j = i + 1; j < bubbles.length; j += 1) {
+			const a = bubbles[i];
+			const b = bubbles[j];
+			if (a.fusing || b.fusing || a.separating || b.separating || a.x === null || b.x === null) continue;
+			if (nowMs < (a.noFuseUntil ?? 0) || nowMs < (b.noFuseUntil ?? 0)) continue;
+			const overlap = circleOverlapRatio(a, b);
+				if (overlap > 0.4) {
+					return startFusion(a, b, nowMs);
+				}
+			}
+		}
+		return false;
+	}
+
+	function runFusionLoop(nowMs) {
+		clock = nowMs / 1000;
+		const dt = Math.min(2.2, Math.max(0.6, (nowMs - (lastFrameMs || nowMs)) / 16.67));
+		lastFrameMs = nowMs;
+		const dragForced = applyDragForce(dt);
+		const attracted = applyPairAttraction(dt, nowMs);
+		const contained = containBodies();
+		const bodySyncChanged = syncBodies();
+		const animated = advanceFusionAnimations(nowMs);
+		const separated = advanceSeparationAnimations(nowMs);
+		const fused = detectFusion(nowMs);
+		if (dragForced || attracted || contained || bodySyncChanged || animated || separated || fused) bubbles = [...bubbles];
+		rafId = requestAnimationFrame(runFusionLoop);
 	}
 
 	function startBubbleDrag(e, bubble) {
+		if (bubble.fusing || bubble.separating || bubble.x === null || bubble.y === null) return;
 		if (!bubbleStageEl) return;
 		const stageRect = bubbleStageEl.getBoundingClientRect();
 		dragState = {
-			id: bubble.id,
+			uid: bubble.uid,
 			startX: e.clientX,
 			startY: e.clientY,
 			originX: bubble.x,
 			originY: bubble.y,
+			targetX: bubble.x,
+			targetY: bubble.y,
 			stageWidth: stageRect.width,
 			stageHeight: stageRect.height,
 			moved: false
@@ -311,51 +909,59 @@
 		const deltaX = e.clientX - dragState.startX;
 		const deltaY = e.clientY - dragState.startY;
 		if (Math.abs(deltaX) > 4 || Math.abs(deltaY) > 4) dragState.moved = true;
-		const nextX = dragState.originX + (deltaX / dragState.stageWidth) * 100;
-		const nextY = dragState.originY + (deltaY / dragState.stageHeight) * 100;
-		const clampedX = Math.max(8, Math.min(92, nextX));
-		const clampedY = Math.max(16, Math.min(84, nextY));
-		bubbles = bubbles.map((bubble) =>
-			bubble.id === dragState.id ? { ...bubble, x: clampedX, y: clampedY } : bubble
+		const bubble = bubbles.find((candidate) => candidate.uid === dragState.uid);
+		if (!bubble) return;
+		const clampedX = Math.max(
+			bubble.radius,
+			Math.min(dragState.stageWidth - bubble.radius, dragState.originX + deltaX)
 		);
+		const clampedY = Math.max(
+			bubble.radius,
+			Math.min(dragState.stageHeight - bubble.radius, dragState.originY + deltaY)
+		);
+		dragState.targetX = clampedX;
+		dragState.targetY = clampedY;
 	}
 
 	function stopBubbleDrag() {
-		if (dragState && !dragState.moved) toggleBubble(dragState.id);
+		if (dragState && !dragState.moved) toggleBubble(dragState.uid);
+		if (dragState?.moved) {
+			const body = bubbleBodies.get(dragState.uid);
+			if (body) {
+				Matter.Body.setVelocity(body, {
+					x: body.velocity.x * 0.42,
+					y: body.velocity.y * 0.42
+				});
+			}
+		}
 		dragState = null;
 		window.removeEventListener('pointermove', onBubbleDrag);
 		window.removeEventListener('pointerup', stopBubbleDrag);
 		window.removeEventListener('pointercancel', stopBubbleDrag);
 	}
 
-	function adjustVolumeWithWheel(e, id) {
+	function adjustVolumeWithWheel(e, uid) {
 		const delta = e.deltaY < 0 ? 0.04 : -0.04;
-		const current = bubbles.find((bubble) => bubble.id === id)?.volume ?? 0.45;
-		setVolume(id, current + delta);
+		const current = bubbles.find((bubble) => bubble.uid === uid)?.volume ?? 0.45;
+		setVolume(uid, current + delta);
 	}
 
 	function saveMix() {
 		const snapshot = Object.fromEntries(
-			bubbles.filter((b) => b.active).map((b) => [b.id, Number(b.volume.toFixed(2))])
+			bubbles.filter((b) => b.active).map((b) => [b.sourceType, Number(b.volume.toFixed(2))])
 		);
 		if (!Object.keys(snapshot).length) return;
 		const label = mixLabel.trim() || `Jar ${mixes.length + 1}`;
-		mixes = [{ label, scene: activeScene, mix: snapshot, id: Date.now() }, ...mixes];
+		mixes = [{ label, mix: snapshot, id: Date.now() }, ...mixes];
 		mixLabel = '';
 	}
 
 	function loadMix(jar) {
-		activeScene = jar.scene;
-		applyPreset(jar.mix);
+		applyMix(jar.mix);
 	}
 
-	function applyPresetJar(sceneKey, mix) {
-		activeScene = sceneKey;
-		applyPreset(mix);
-	}
-
-	function jarToneStyle(sceneKey) {
-		const tone = scenes[sceneKey].colors;
+	function jarToneStyle() {
+		const tone = calmScene.colors;
 		return `--lid-a:${tone.bgA};--lid-b:${tone.bgB};--jar:${tone.bubble};--jar-glow:${tone.bgB};`;
 	}
 
@@ -363,23 +969,29 @@
 		return `--fill:${Math.max(15, Object.keys(mix).length * 18)}%;`;
 	}
 
-	function sceneTagStyle(sceneKey) {
-		const tone = scenes[sceneKey].colors;
-		return `--tag-bg:${tone.bgB};--tag-fg:${tone.text};--tag-border:${tone.bgA};`;
-	}
-
 	function clearAll() {
 		bubbles = bubbles.map((bubble) => {
-			updateEngineVolume(bubble.id, false, bubble.volume);
-			return { ...bubble, active: false };
+			const next = {
+				...bubble,
+				active: false,
+				fusing: false,
+				separating: false,
+				fusionScale: 1,
+				fusionOpacity: 1
+			};
+			updateBubbleAudio(next);
+			return next;
 		});
+		fusionAnimations = [];
+		separationAnimations = [];
 		activeJarKey = null;
 		void hardStopAudio();
 	}
 
-	function switchScene(sceneKey) {
-		activeScene = sceneKey;
-		activeJarKey = null;
+	function handleBubbleDoubleClick(uid) {
+		const bubble = bubbles.find((candidate) => candidate.uid === uid);
+		if (!bubble) return;
+		startSeparation(bubble, performance.now());
 	}
 
 	function moveMixToTarget(dragId, targetId) {
@@ -439,48 +1051,32 @@
 		loadMix(jar);
 		activeJarKey = jarKey;
 	}
-
-	function handlePresetJarClick(preset) {
-		const jarKey = `preset:${preset.sceneKey}:${preset.name}`;
-		if (activeJarKey === jarKey) {
-			clearAll();
-			return;
-		}
-		applyPresetJar(preset.sceneKey, preset.mix);
-		activeJarKey = jarKey;
-	}
 </script>
 
 <main class="workspace" style={`--bgA:${palette.bgA};--bgB:${palette.bgB};--panel:${palette.panel};--bubble:${palette.bubble};--text:${palette.text};--soft:${palette.soft};`}>
 	<section class="top-row">
 		<div>
-			<h1>{scenes[activeScene].title} Scene</h1>
-			<p>{scenes[activeScene].subtitle}</p>
+			<h1>{calmScene.title}</h1>
+			<p>{calmScene.subtitle}</p>
 		</div>
-		<nav class="scene-nav" aria-label="Scene switcher">
-			{#each Object.keys(scenes) as sceneKey}
-				<button class:active={sceneKey === activeScene} style={sceneTagStyle(sceneKey)} on:click={() => switchScene(sceneKey)}>
-					{scenes[sceneKey].title}
-				</button>
-			{/each}
-		</nav>
 	</section>
 
 	<section class="bubble-stage" bind:this={bubbleStageEl} on:wheel|preventDefault>
 		{#each bubbles as bubble}
-			{@const scale = 0.8 + bubble.volume * 0.65}
-			{@const opacity = 0.4 + bubble.volume * 0.6}
-			<article class="bubble-shell" style={`--scale:${scale};--opacity:${opacity};--drift:${bubble.drift}s;left:${bubble.x}%;top:${bubble.y}%;`}>
+			{@const pulse = 1 + 0.1 * Math.sin(2 * Math.PI * bubble.pulseFrequency * clock)}
+			{@const scale = (0.82 + bubble.volume * 0.5) * pulse * bubble.fusionScale}
+			{@const opacity = (0.35 + bubble.volume * 0.65) * bubble.fusionOpacity}
+			<article class="bubble-shell" style={`--scale:${scale};--opacity:${opacity};--drift:${bubble.drift}s;--floatState:${bubble.fusing ? 'paused' : 'running'};--diameter:${bubble.radius * 2}px;left:${bubble.x ?? 0}px;top:${bubble.y ?? 0}px;`}>
 				<button
 					class="bubble"
 					class:active={bubble.active}
+					class:fusing={bubble.fusing}
 					on:pointerdown={(e) => startBubbleDrag(e, bubble)}
-					on:wheel|preventDefault={(e) => adjustVolumeWithWheel(e, bubble.id)}
+					on:dblclick|preventDefault={() => handleBubbleDoubleClick(bubble.uid)}
+					on:wheel|preventDefault={(e) => adjustVolumeWithWheel(e, bubble.uid)}
 					aria-pressed={bubble.active}
 					aria-label={`${bubble.label}, ${Math.round(bubble.volume * 100)} percent volume`}
-				>
-					<span>{bubble.icon}</span>
-				</button>
+				></button>
 				<h3>{bubble.label}</h3>
 				<p>{Math.round(bubble.volume * 100)}%</p>
 			</article>
@@ -507,30 +1103,17 @@
 		</button>
 		<div class="drawer-inner">
 			<h2>Cabinet</h2>
-			<section class="cabinet-presets">
-				<h3>Preset Jars</h3>
-				<div class="jar-grid">
-					{#each presetJars as preset}
-						<button class="jar" style={jarToneStyle(preset.sceneKey)} on:click={() => handlePresetJarClick(preset)}>
-							<div class="lid"></div>
-							<div class="liquid" style={jarLiquidStyle(preset.mix)}></div>
-							<p>{preset.name}</p>
-						</button>
-					{/each}
-				</div>
-			</section>
-
 			{#if mixes.length === 0}
 				<p class="empty">No jars yet. Save your current mix.</p>
 			{:else}
 				<section class="cabinet-mixes">
-					<h3>Saved Mixes</h3>
+					<h3>Saved Jars</h3>
 					<div class="jar-grid">
 						{#each mixes as jar}
 							<button
 								class="jar"
 								class:dragging={draggingMixId === jar.id}
-								style={jarToneStyle(jar.scene)}
+								style={jarToneStyle()}
 								on:pointerdown={(event) => startMixPointerDrag(event, jar.id)}
 								on:pointerenter={() => hoverMixTarget(jar.id)}
 								on:click={() => handleSavedJarClick(jar)}
@@ -557,7 +1140,7 @@
 	:global(body) {
 		margin: 0;
 		font-family: 'Avenir Next', 'Trebuchet MS', sans-serif;
-		background: #050709;
+		background: #071227;
 		color: #fff;
 	}
 
@@ -578,7 +1161,10 @@
 		grid-template-rows: auto 1fr auto;
 		gap: 1.1rem;
 		padding: 1.2rem 1.2rem 1.2rem 1.6rem;
-		background: radial-gradient(circle at 10% 10%, var(--bgB) 0%, var(--bgA) 62%, #c8b9ac 100%);
+		background:
+			radial-gradient(circle at 16% 18%, rgba(142, 191, 255, 0.2), transparent 40%),
+			radial-gradient(circle at 82% 84%, rgba(132, 171, 235, 0.16), transparent 44%),
+			linear-gradient(155deg, #09172f 0%, var(--bgA) 46%, var(--bgB) 100%);
 		color: var(--text);
 		box-sizing: border-box;
 		overflow: hidden;
@@ -602,26 +1188,16 @@
 		color: var(--soft);
 	}
 
-	.scene-nav {
-		display: flex;
-		gap: 0.4rem;
-		flex-wrap: wrap;
-	}
-
-	.scene-nav button,
 	.save-box button,
 	.clear,
 	.drawer-toggle {
-		border: 1px solid var(--tag-border, rgba(255, 255, 255, 0.4));
+		border: 1px solid rgba(197, 223, 255, 0.2);
 		border-radius: 0.85rem;
-		background: color-mix(in srgb, var(--tag-bg, #ffffff) 70%, #ffffff 30%);
-		color: var(--tag-fg, var(--text));
+		background: rgba(136, 182, 250, 0.08);
+		color: var(--text);
 		padding: 0.5rem 0.8rem;
 		cursor: pointer;
-	}
-
-	.scene-nav button.active {
-		box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.7);
+		backdrop-filter: blur(16px) saturate(118%);
 	}
 
 	.bubble-stage {
@@ -631,10 +1207,11 @@
 		border-radius: 1.15rem;
 		overflow: hidden;
 		background:
-			radial-gradient(circle at 20% 18%, rgba(255, 255, 255, 0.28), transparent 46%),
-			radial-gradient(circle at 82% 84%, rgba(255, 255, 255, 0.22), transparent 40%),
-			linear-gradient(165deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.05));
-		backdrop-filter: blur(10px);
+			radial-gradient(circle at 22% 16%, rgba(153, 210, 255, 0.22), transparent 42%),
+			radial-gradient(circle at 76% 86%, rgba(130, 179, 240, 0.18), transparent 40%),
+			linear-gradient(170deg, rgba(129, 176, 236, 0.1), rgba(83, 123, 188, 0.07));
+		border: 1px solid rgba(182, 214, 255, 0.2);
+		backdrop-filter: blur(14px) saturate(120%);
 	}
 
 	.bubble-shell {
@@ -645,14 +1222,17 @@
 		gap: 0.4rem;
 		animation: float 7s ease-in-out infinite;
 		animation-delay: calc(var(--drift) * -1s);
+		animation-play-state: var(--floatState);
 	}
 
 	.bubble {
-		width: 84px;
-		height: 84px;
-		border: none;
+		width: var(--diameter);
+		height: var(--diameter);
+		border: 1px solid rgba(201, 229, 255, 0.18);
 		border-radius: 50%;
-		background: color-mix(in srgb, var(--bubble) 86%, #ffffff 14%);
+		background:
+			radial-gradient(circle at 42% 38%, rgba(198, 225, 255, 0.32) 0%, rgba(145, 188, 244, 0.18) 36%, rgba(96, 139, 214, 0.12) 62%, rgba(66, 100, 164, 0.08) 100%),
+			linear-gradient(155deg, rgba(177, 214, 255, 0.08), rgba(87, 125, 196, 0.14));
 		color: #5a4f45;
 		font-weight: 700;
 		font-size: 1.1rem;
@@ -660,24 +1240,44 @@
 		transform: scale(var(--scale)) translateZ(0);
 		cursor: grab;
 		position: relative;
-		transition: transform 0.15s linear, opacity 0.15s linear, box-shadow 0.18s ease;
+		transition: transform 0.15s linear, opacity 0.15s linear, box-shadow 0.18s ease, filter 0.2s ease;
 		touch-action: none;
 		user-select: none;
 		isolation: isolate;
+		backdrop-filter: blur(10px) saturate(116%);
+		box-shadow:
+			inset -10px -12px 18px rgba(89, 137, 217, 0.12),
+			inset 8px 10px 16px rgba(211, 233, 255, 0.2),
+			0 8px 24px rgba(35, 66, 124, 0.2);
 	}
 
+	.bubble::before,
 	.bubble::after {
 		content: '';
 		position: absolute;
 		left: 50%;
 		top: 50%;
-		width: 100%;
-		height: 100%;
 		border-radius: 50%;
-		transform: translate(-50%, -50%) scale(1);
-		background: radial-gradient(circle, color-mix(in srgb, var(--bubble) 52%, #fff 48%) 0%, transparent 68%);
-		opacity: 0;
 		pointer-events: none;
+	}
+
+	.bubble::before {
+		width: 56%;
+		height: 42%;
+		left: 33%;
+		top: 31%;
+		transform: translate(-50%, -50%) rotate(-21deg);
+		background: radial-gradient(circle, rgba(233, 245, 255, 0.44) 0%, rgba(210, 233, 255, 0.14) 46%, transparent 75%);
+		filter: blur(2px);
+	}
+
+	.bubble::after {
+		width: 114%;
+		height: 114%;
+		transform: translate(-50%, -50%) scale(1);
+		background: radial-gradient(circle, rgba(159, 206, 255, 0.26) 0%, rgba(128, 180, 243, 0.14) 42%, transparent 74%);
+		opacity: 0.42;
+		filter: blur(4px);
 		z-index: -1;
 	}
 
@@ -685,12 +1285,18 @@
 		cursor: grabbing;
 	}
 
+	.bubble.fusing {
+		pointer-events: none;
+	}
+
 	.bubble.active {
 		box-shadow:
-			0 0 0 1px rgba(255, 255, 255, 0.6),
-			0 0 16px color-mix(in srgb, var(--bubble) 65%, #fff 35%),
-			0 0 36px color-mix(in srgb, var(--bubble) 55%, #fff 45%);
+			inset -10px -12px 18px rgba(94, 148, 228, 0.18),
+			inset 8px 10px 16px rgba(226, 242, 255, 0.24),
+			0 0 18px rgba(128, 181, 246, 0.42),
+			0 0 42px rgba(108, 165, 235, 0.28);
 		animation: aura 2.2s ease-in-out infinite;
+		filter: saturate(1.08);
 	}
 
 	.bubble.active::after {
@@ -701,15 +1307,17 @@
 		0%,
 		100% {
 			box-shadow:
-				0 0 0 1px rgba(255, 255, 255, 0.6),
-				0 0 16px color-mix(in srgb, var(--bubble) 55%, #fff 45%),
-				0 0 32px color-mix(in srgb, var(--bubble) 45%, #fff 55%);
+				inset -10px -12px 18px rgba(100, 150, 228, 0.14),
+				inset 8px 10px 16px rgba(226, 242, 255, 0.2),
+				0 0 16px rgba(142, 194, 255, 0.36),
+				0 0 34px rgba(116, 174, 243, 0.24);
 		}
 		50% {
 			box-shadow:
-				0 0 0 1px rgba(255, 255, 255, 0.7),
-				0 0 26px color-mix(in srgb, var(--bubble) 75%, #fff 25%),
-				0 0 52px color-mix(in srgb, var(--bubble) 60%, #fff 40%);
+				inset -10px -12px 20px rgba(108, 161, 238, 0.2),
+				inset 8px 10px 18px rgba(231, 245, 255, 0.28),
+				0 0 26px rgba(166, 209, 255, 0.46),
+				0 0 52px rgba(130, 187, 255, 0.3);
 		}
 	}
 
@@ -736,7 +1344,7 @@
 		font-size: 0.76rem;
 		color: var(--soft);
 		padding: 0.12rem 0.4rem;
-		background: rgba(255, 255, 255, 0.26);
+		background: rgba(255, 255, 255, 0.12);
 		border-radius: 999px;
 	}
 
@@ -746,7 +1354,7 @@
 		bottom: 0.7rem;
 		margin: 0;
 		font-size: 0.8rem;
-		color: rgba(64, 57, 50, 0.72);
+		color: rgba(195, 219, 248, 0.82);
 	}
 
 	@keyframes float {
@@ -775,11 +1383,12 @@
 	}
 
 	.save-box input {
-		background: rgba(255, 255, 255, 0.28);
-		border: 1px solid rgba(255, 255, 255, 0.44);
+		background: rgba(147, 191, 255, 0.12);
+		border: 1px solid rgba(191, 221, 255, 0.22);
 		border-radius: 0.7rem;
 		padding: 0.38rem 0.62rem;
 		color: var(--text);
+		backdrop-filter: blur(14px);
 	}
 
 	.drawer {
@@ -789,11 +1398,12 @@
 		position: relative;
 		width: min(300px, 78vw);
 		height: 100%;
-		background: rgba(244, 238, 229, 0.48);
-		border: 1px solid rgba(255, 255, 255, 0.42);
+		background: rgba(122, 173, 243, 0.09);
+		border: 1px solid rgba(190, 221, 255, 0.2);
 		border-radius: 1rem;
 		overflow: hidden;
 		transition: width 0.25s ease;
+		backdrop-filter: blur(18px) saturate(118%);
 	}
 
 	.drawer.closed {
@@ -814,14 +1424,14 @@
 		border-radius: 0;
 		font-size: 0.86rem;
 		font-weight: 600;
-		color: rgba(88, 76, 65, 0.86);
+		color: rgba(192, 220, 255, 0.84);
 		transition: transform 0.18s ease, color 0.18s ease, opacity 0.18s ease;
 		opacity: 0.72;
 	}
 
 	.drawer-toggle:hover {
 		opacity: 1;
-		color: rgba(76, 66, 57, 0.98);
+		color: rgba(224, 239, 255, 0.98);
 		transform: translateY(-50%) scale(1.05);
 	}
 
@@ -857,26 +1467,17 @@
 		display: none;
 	}
 
-	.cabinet-presets {
-		margin-top: 0.7rem;
-		padding: 0.7rem;
-		border-radius: 0.9rem;
-		background: rgba(255, 255, 255, 0.22);
-		border: 1px solid rgba(255, 255, 255, 0.38);
-	}
-
-	.cabinet-presets h3,
 	.cabinet-mixes h3 {
 		font-size: 0.9rem;
-		color: #5b534a;
+		color: #cde2ff;
 	}
 
 	.cabinet-mixes {
-		margin-top: 0.9rem;
+		margin-top: 0.7rem;
 	}
 
 	.empty {
-		color: #7a726a;
+		color: rgba(199, 220, 248, 0.8);
 		font-size: 0.9rem;
 		margin-top: 1rem;
 	}
@@ -889,13 +1490,14 @@
 	}
 
 	.jar {
-		border: 1px solid rgba(255, 255, 255, 0.48);
+		border: 1px solid rgba(194, 223, 255, 0.22);
 		border-radius: 1rem;
 		padding: 0.6rem 0.5rem;
-		background: rgba(255, 255, 255, 0.26);
+		background: rgba(141, 188, 247, 0.12);
 		cursor: grab;
-		color: #5e554c;
+		color: #d8e9ff;
 		user-select: none;
+		backdrop-filter: blur(14px) saturate(116%);
 	}
 
 	.jar:active {
@@ -911,7 +1513,7 @@
 		width: 56%;
 		height: 9px;
 		margin: 0 auto;
-		background: linear-gradient(180deg, var(--lid-b, #8b9eb2), var(--lid-a, #5f6f7f));
+		background: linear-gradient(180deg, var(--lid-b, #5f8dce), var(--lid-a, #3f659f));
 		border-radius: 0.4rem;
 	}
 
@@ -921,14 +1523,14 @@
 		margin: 0.2rem auto 0.4rem;
 		width: 72%;
 		border-radius: 0.85rem;
-		border: 1px solid color-mix(in srgb, var(--jar, #d8cfc4) 56%, #ffffff 44%);
+		border: 1px solid rgba(194, 223, 255, 0.2);
 		background: linear-gradient(
 			180deg,
-			rgba(255, 255, 255, 0.22) 0%,
-			color-mix(in srgb, var(--jar, #d8cfc4) 34%, #ffffff 66%) calc(100% - var(--fill)),
-			color-mix(in srgb, var(--jar-glow, #b9aca0) 74%, #ffffff 26%) 100%
+			rgba(220, 238, 255, 0.14) 0%,
+			color-mix(in srgb, var(--jar, #9dccff) 20%, transparent 80%) calc(100% - var(--fill)),
+			color-mix(in srgb, var(--jar-glow, #72a4df) 30%, transparent 70%) 100%
 		);
-		box-shadow: inset 0 0 14px color-mix(in srgb, var(--jar, #d8cfc4) 40%, #ffffff 60%);
+		box-shadow: inset 0 0 14px rgba(169, 203, 245, 0.22);
 	}
 
 	.jar p {
