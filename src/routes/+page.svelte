@@ -68,6 +68,7 @@
 		fusionScale: 1,
 		fusionOpacity: 1,
 		drift: (i % 3) * 1.15,
+		bornAt: 0,
 		vx: 0,
 		vy: 0,
 		ax: 0,
@@ -83,6 +84,7 @@
 	let rafId = null;
 	let fusionAnimations = [];
 	let separationAnimations = [];
+	let fusionContactSince = new Map();
 	let clock = 0;
 	let lastFrameMs = 0;
 
@@ -140,10 +142,10 @@
 	function attachBody(bubble) {
 		if (!physicsEngine || bubbleBodies.has(bubble.uid) || bubble.x === null || bubble.y === null) return;
 		const body = Matter.Bodies.circle(bubble.x, bubble.y, bubble.radius, {
-			restitution: 0.22,
-			frictionAir: 0.045,
-			friction: 0.02,
-			frictionStatic: 0.05,
+			restitution: 0.08,
+			frictionAir: 0.085,
+			friction: 0.035,
+			frictionStatic: 0.1,
 			density: 0.0011
 		});
 		body.label = `bubble:${bubble.uid}`;
@@ -202,13 +204,28 @@
 		const bubble = bubbles.find((candidate) => candidate.uid === dragState.uid);
 		const body = bubble ? bubbleBodies.get(bubble.uid) : null;
 		if (!bubble || !body) return false;
-		const k = 0.00062 + bubble.mass * 0.00000006;
-		const damping = 0.17;
 		const dx = dragState.targetX - body.position.x;
 		const dy = dragState.targetY - body.position.y;
-		const fx = dx * k - body.velocity.x * damping;
-		const fy = dy * k - body.velocity.y * damping;
+		const distance = Math.hypot(dx, dy);
+		if (distance < 0.01) return false;
+		const nx = dx / distance;
+		const ny = dy / distance;
+		const spring = 0.00009;
+		const maxPull = 0.00035;
+		const pull = Math.min(distance * spring, maxPull);
+		const damping = 0.22;
+		const fx = nx * pull - body.velocity.x * damping * 0.00008;
+		const fy = ny * pull - body.velocity.y * damping * 0.00008;
 		Matter.Body.applyForce(body, body.position, { x: fx * dt, y: fy * dt });
+		const dragMaxSpeed = 2.2;
+		const speed = Math.hypot(body.velocity.x, body.velocity.y);
+		if (speed > dragMaxSpeed) {
+			const ratio = dragMaxSpeed / speed;
+			Matter.Body.setVelocity(body, {
+				x: body.velocity.x * ratio,
+				y: body.velocity.y * ratio
+			});
+		}
 		return Math.abs(dx) > 0.05 || Math.abs(dy) > 0.05;
 	}
 
@@ -228,15 +245,18 @@
 				const dx = bodyB.position.x - bodyA.position.x;
 				const dy = bodyB.position.y - bodyA.position.y;
 				const distance = Math.hypot(dx, dy) || 1;
-				const minGap = a.radius + b.radius + 8;
-				const interactionRange = (a.radius + b.radius) * 1.45;
+				const overlap = circleOverlapRatio(a, b);
+				const draggedPair = dragState && (dragState.uid === a.uid || dragState.uid === b.uid);
+				const minGap = a.radius + b.radius + 12;
+				const interactionRange = (a.radius + b.radius) * 1.28;
 				if (distance > interactionRange || distance < 1) continue;
 				const nx = dx / distance;
 				const ny = dy / distance;
 
 				// Keep a minimum gap so attraction never causes visible overlap.
-				if (distance <= minGap) {
-					const repel = (minGap - distance) * 0.00001 * dt;
+				// If user is actively dragging one bubble into another, ease repel to allow intentional fusion.
+				if (distance <= minGap && !(draggedPair && distance <= a.radius + b.radius + 6)) {
+					const repel = (minGap - distance) * 0.0000018 * dt;
 					Matter.Body.applyForce(bodyA, bodyA.position, { x: -nx * repel, y: -ny * repel });
 					Matter.Body.applyForce(bodyB, bodyB.position, { x: nx * repel, y: ny * repel });
 					changed = true;
@@ -244,7 +264,7 @@
 				}
 
 				const pull = 1 - distance / interactionRange;
-				const forceMag = pull * 0.0000026 * Math.sqrt(a.mass * b.mass);
+				const forceMag = pull * 0.0000011 * Math.sqrt(a.mass * b.mass);
 				const force = { x: nx * forceMag * dt, y: ny * forceMag * dt };
 				Matter.Body.applyForce(bodyA, bodyA.position, force);
 				Matter.Body.applyForce(bodyB, bodyB.position, { x: -force.x, y: -force.y });
@@ -290,7 +310,7 @@
 			}
 
 			const speed = Math.hypot(vx, vy);
-			const maxSpeed = 4.6;
+			const maxSpeed = 2.4;
 			if (speed > maxSpeed) {
 				const ratio = maxSpeed / speed;
 				vx *= ratio;
@@ -584,10 +604,17 @@
 		return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 	}
 
+	function easeOutCubic(t) {
+		return 1 - Math.pow(1 - t, 3);
+	}
+
 	function formatBubbleLabel(components) {
 		if (!components?.length) return 'Blend';
-		if (components.length === 1) return labelBySource[components[0]] ?? components[0];
-		return `Blend ${components.length}`;
+		const unique = [...new Set(components)];
+		if (unique.length === 1) return labelBySource[unique[0]] ?? unique[0];
+		const names = unique.map((source) => labelBySource[source] ?? source);
+		if (names.length <= 3) return names.join(' + ');
+		return `${names.slice(0, 2).join(' + ')} +${names.length - 2}`;
 	}
 
 	function startFusion(a, b, nowMs) {
@@ -628,6 +655,7 @@
 			fusionScale: 1,
 			fusionOpacity: 1,
 			drift: ((a.drift ?? 0) + (b.drift ?? 0)) / 2,
+			bornAt: clock,
 			vx: 0,
 			vy: 0,
 			ax: 0,
@@ -745,6 +773,7 @@
 			fusionScale: 0.88,
 			fusionOpacity: 0,
 			drift: parent.drift - 0.4,
+			bornAt: clock,
 			vx: 0,
 			vy: 0,
 			ax: 0,
@@ -775,6 +804,7 @@
 			fusionScale: 0.88,
 			fusionOpacity: 0,
 			drift: parent.drift + 0.4,
+			bornAt: clock,
 			vx: 0,
 			vy: 0,
 			ax: 0,
@@ -851,18 +881,53 @@
 	}
 
 	function detectFusion(nowMs) {
-		if (fusionAnimations.length) return false;
+		if (fusionAnimations.length) {
+			fusionContactSince.clear();
+			return false;
+		}
+		const seenKeys = new Set();
 		for (let i = 0; i < bubbles.length; i += 1) {
 			for (let j = i + 1; j < bubbles.length; j += 1) {
-			const a = bubbles[i];
-			const b = bubbles[j];
-			if (a.fusing || b.fusing || a.separating || b.separating || a.x === null || b.x === null) continue;
-			if (nowMs < (a.noFuseUntil ?? 0) || nowMs < (b.noFuseUntil ?? 0)) continue;
-			const overlap = circleOverlapRatio(a, b);
-				if (overlap > 0.4) {
+				const a = bubbles[i];
+				const b = bubbles[j];
+				const pairKey = a.uid < b.uid ? `${a.uid}:${b.uid}` : `${b.uid}:${a.uid}`;
+				seenKeys.add(pairKey);
+				if (a.fusing || b.fusing || a.separating || b.separating || a.x === null || b.x === null) {
+					fusionContactSince.delete(pairKey);
+					continue;
+				}
+				if (nowMs < (a.noFuseUntil ?? 0) || nowMs < (b.noFuseUntil ?? 0)) {
+					fusionContactSince.delete(pairKey);
+					continue;
+				}
+				const dx = (a.x ?? 0) - (b.x ?? 0);
+				const dy = (a.y ?? 0) - (b.y ?? 0);
+				const distance = Math.hypot(dx, dy);
+				const overlap = circleOverlapRatio(a, b);
+				const draggedPair = dragState && (dragState.uid === a.uid || dragState.uid === b.uid);
+				const dragTouchDistance = a.radius + b.radius + 5;
+				const closeEnough = draggedPair ? distance <= dragTouchDistance : overlap > 0.48;
+				if (!closeEnough) {
+					fusionContactSince.delete(pairKey);
+					continue;
+				}
+				const relativeSpeed = Math.hypot((a.vx ?? 0) - (b.vx ?? 0), (a.vy ?? 0) - (b.vy ?? 0));
+				const speedThreshold = draggedPair ? 2.8 : 2.1;
+				if (relativeSpeed > speedThreshold) {
+					fusionContactSince.delete(pairKey);
+					continue;
+				}
+				const contactStart = fusionContactSince.get(pairKey) ?? nowMs;
+				if (!fusionContactSince.has(pairKey)) fusionContactSince.set(pairKey, contactStart);
+				const holdMs = draggedPair ? 320 : 170;
+				if (nowMs - contactStart >= holdMs) {
+					fusionContactSince.delete(pairKey);
 					return startFusion(a, b, nowMs);
 				}
 			}
+		}
+		for (const key of fusionContactSince.keys()) {
+			if (!seenKeys.has(key)) fusionContactSince.delete(key);
 		}
 		return false;
 	}
@@ -898,6 +963,11 @@
 			stageHeight: stageRect.height,
 			moved: false
 		};
+		const body = bubbleBodies.get(bubble.uid);
+		if (body) {
+			Matter.Body.setVelocity(body, { x: body.velocity.x * 0.22, y: body.velocity.y * 0.22 });
+			Matter.Body.setAngularVelocity(body, 0);
+		}
 		e.preventDefault();
 		window.addEventListener('pointermove', onBubbleDrag);
 		window.addEventListener('pointerup', stopBubbleDrag);
@@ -921,18 +991,25 @@
 		);
 		dragState.targetX = clampedX;
 		dragState.targetY = clampedY;
+		const body = bubbleBodies.get(dragState.uid);
+		if (body) {
+			const prevX = body.position.x;
+			const prevY = body.position.y;
+			const nextX = body.position.x + (clampedX - body.position.x) * 0.22;
+			const nextY = body.position.y + (clampedY - body.position.y) * 0.22;
+			Matter.Body.setPosition(body, { x: nextX, y: nextY });
+			Matter.Body.setVelocity(body, {
+				x: (nextX - prevX) * 0.55,
+				y: (nextY - prevY) * 0.55
+			});
+		}
 	}
 
 	function stopBubbleDrag() {
 		if (dragState && !dragState.moved) toggleBubble(dragState.uid);
-		if (dragState?.moved) {
+		if (dragState) {
 			const body = bubbleBodies.get(dragState.uid);
-			if (body) {
-				Matter.Body.setVelocity(body, {
-					x: body.velocity.x * 0.42,
-					y: body.velocity.y * 0.42
-				});
-			}
+			if (body) Matter.Body.setVelocity(body, { x: body.velocity.x * 0.1, y: body.velocity.y * 0.1 });
 		}
 		dragState = null;
 		window.removeEventListener('pointermove', onBubbleDrag);
@@ -1064,9 +1141,12 @@
 	<section class="bubble-stage" bind:this={bubbleStageEl} on:wheel|preventDefault>
 		{#each bubbles as bubble}
 			{@const pulse = 1 + 0.1 * Math.sin(2 * Math.PI * bubble.pulseFrequency * clock)}
-			{@const scale = (0.82 + bubble.volume * 0.5) * pulse * bubble.fusionScale}
-			{@const opacity = (0.35 + bubble.volume * 0.65) * bubble.fusionOpacity}
-			<article class="bubble-shell" style={`--scale:${scale};--opacity:${opacity};--drift:${bubble.drift}s;--floatState:${bubble.fusing ? 'paused' : 'running'};--diameter:${bubble.radius * 2}px;left:${bubble.x ?? 0}px;top:${bubble.y ?? 0}px;`}>
+			{@const emergeRaw = Math.min(1, Math.max(0, (clock - (bubble.bornAt ?? 0)) / 0.95))}
+			{@const emerge = easeOutCubic(emergeRaw)}
+			{@const emergeScale = 0.72 + emerge * 0.28}
+			{@const scale = (0.82 + bubble.volume * 0.5) * pulse * bubble.fusionScale * emergeScale}
+			{@const opacity = (0.35 + bubble.volume * 0.65) * bubble.fusionOpacity * (0.25 + emerge * 0.75)}
+			<article class="bubble-shell" style={`--scale:${scale};--opacity:${opacity};--emerge:${emerge};--drift:${bubble.drift}s;--floatState:${bubble.fusing ? 'paused' : 'running'};--diameter:${bubble.radius * 2}px;left:${bubble.x ?? 0}px;top:${bubble.y ?? 0}px;`}>
 				<button
 					class="bubble"
 					class:active={bubble.active}
@@ -1240,7 +1320,7 @@
 		transform: scale(var(--scale)) translateZ(0);
 		cursor: grab;
 		position: relative;
-		transition: transform 0.15s linear, opacity 0.15s linear, box-shadow 0.18s ease, filter 0.2s ease;
+		transition: transform 0.32s ease, opacity 0.32s ease, box-shadow 0.28s ease, filter 0.35s ease;
 		touch-action: none;
 		user-select: none;
 		isolation: isolate;
@@ -1249,6 +1329,7 @@
 			inset -10px -12px 18px rgba(89, 137, 217, 0.12),
 			inset 8px 10px 16px rgba(211, 233, 255, 0.2),
 			0 8px 24px rgba(35, 66, 124, 0.2);
+		filter: blur(calc((1 - var(--emerge)) * 2.2px));
 	}
 
 	.bubble::before,
@@ -1268,7 +1349,8 @@
 		top: 31%;
 		transform: translate(-50%, -50%) rotate(-21deg);
 		background: radial-gradient(circle, rgba(233, 245, 255, 0.44) 0%, rgba(210, 233, 255, 0.14) 46%, transparent 75%);
-		filter: blur(2px);
+		filter: blur(calc(1px + (1 - var(--emerge)) * 1.6px));
+		opacity: calc(0.25 + var(--emerge) * 0.75);
 	}
 
 	.bubble::after {
@@ -1276,8 +1358,8 @@
 		height: 114%;
 		transform: translate(-50%, -50%) scale(1);
 		background: radial-gradient(circle, rgba(159, 206, 255, 0.26) 0%, rgba(128, 180, 243, 0.14) 42%, transparent 74%);
-		opacity: 0.42;
-		filter: blur(4px);
+		opacity: calc(0.12 + var(--emerge) * 0.3);
+		filter: blur(calc(2px + (1 - var(--emerge)) * 3px));
 		z-index: -1;
 	}
 
@@ -1295,12 +1377,12 @@
 			inset 8px 10px 16px rgba(226, 242, 255, 0.24),
 			0 0 18px rgba(128, 181, 246, 0.42),
 			0 0 42px rgba(108, 165, 235, 0.28);
-		animation: aura 2.2s ease-in-out infinite;
+		animation: aura 3.4s ease-in-out infinite;
 		filter: saturate(1.08);
 	}
 
 	.bubble.active::after {
-		animation: aura-size 2.2s ease-in-out infinite;
+		animation: aura-size 3.4s ease-in-out infinite;
 	}
 
 	@keyframes aura {
