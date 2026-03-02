@@ -4,22 +4,50 @@
 	import Matter from 'matter-js';
 
 	const bubbleDefs = [
-		{ id: 'rain', label: 'Rain', icon: 'R' },
-		{ id: 'wind', label: 'Wind', icon: 'W' },
-		{ id: 'static', label: 'Static', icon: 'S' },
-		{ id: 'birds', label: 'Birds', icon: 'B' },
-		{ id: 'ocean', label: 'Ocean', icon: 'O' },
-		{ id: 'night', label: 'Night', icon: 'N' }
+		{ id: 'rain1', label: 'Rain 1', icon: 'R1' },
+		{ id: 'ocean1', label: 'Ocean 1', icon: 'O1' },
+		{ id: 'white1', label: 'White Noise', icon: 'WN' },
+		{ id: 'waves1', label: 'Waves 1', icon: 'W1' },
+		{ id: 'radio1', label: 'Radio Tuning', icon: 'RT' },
+		{ id: 'rain2', label: 'Rain 2', icon: 'R2' },
+		{ id: 'crowd1', label: 'Crowd 1', icon: 'C1' },
+		{ id: 'bird1', label: 'Bird 1', icon: 'B1' },
+		{ id: 'citytalk1', label: 'City Talk 1', icon: 'CT' }
 	];
 
 	const bubbleSeeds = [
 		{ x: 16, y: 22 },
-		{ x: 34, y: 63 },
-		{ x: 52, y: 30 },
-		{ x: 68, y: 58 },
-		{ x: 80, y: 28 },
-		{ x: 24, y: 44 }
+		{ x: 29, y: 35 },
+		{ x: 12, y: 56 },
+		{ x: 21, y: 74 },
+		{ x: 42, y: 16 },
+		{ x: 57, y: 76 },
+		{ x: 75, y: 14 },
+		{ x: 86, y: 44 },
+		{ x: 61, y: 43 },
+		{ x: 46, y: 54 }
 	];
+
+	const externalAudioUrls = {
+		rain1:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=jlf503jjfa3sk18tio0xxprbgnb5a3qc&file_id=f_2151786422151',
+		ocean1:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=qjbg2rr187rowjyw67hixcwd0i3t8vq0&file_id=f_2151802582857',
+		white1:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=kiy069mc7tfmsx9t40022fds8pjnvr2c&file_id=f_2151805468646',
+		waves1:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=du6gpvuho1be7qcuz6yfruuwxv5x6snq&file_id=f_2151800087153',
+		radio1:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=50slwydix1k99tq5ud6xvxla5brnzvuh&file_id=f_2151805182334',
+		rain2:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=4gzogcitq4eoi1yri7n5japobt874z5b&file_id=f_2151788344067',
+		crowd1:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=14b9fjhh8tqg5ouzeq2q0399s4y847oa&file_id=f_2151790018931',
+		bird1:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=iuixsga7zl5jqy29ynwdk47ee5qwbiv3&file_id=f_2151793717967',
+		citytalk1:
+			'https://duke.app.box.com/index.php?rm=box_download_shared_file&shared_name=8xswg594cbo3nagwhehvl6r1zdytv36y&file_id=f_2151802026132'
+	};
 
 	const calmScene = {
 		title: 'Calm',
@@ -38,7 +66,6 @@
 	let mixes = [];
 	let mixLabel = '';
 
-	let audioCtx;
 	let physicsEngine;
 	let physicsRunner;
 	let wallBodies = [];
@@ -59,8 +86,6 @@
 		radius: 42,
 		mass: 42 * 42,
 		pulseFrequency: 0.09 + (i % 4) * 0.015,
-		audioSource: null,
-		gainNode: null,
 		engine: null,
 		fusing: false,
 		separating: false,
@@ -335,21 +360,11 @@
 				// best effort
 			}
 			bubble.engine = null;
-			bubble.audioSource = null;
-			bubble.gainNode = null;
 		}
 	}
 
 	async function hardStopAudio() {
 		destroyAllEngines();
-		if (audioCtx && audioCtx.state !== 'closed') {
-			try {
-				await audioCtx.close();
-			} catch {
-				// best effort
-			}
-		}
-		audioCtx = undefined;
 	}
 
 	onMount(() => {
@@ -389,120 +404,44 @@
 		localStorage.setItem('calm-mixes', JSON.stringify(mixes));
 	}
 
-	function ensureContext() {
-		if (!audioCtx) audioCtx = new AudioContext();
-		if (audioCtx.state === 'suspended') audioCtx.resume();
-	}
-
-	function createNoiseEngine(type) {
-		const gainNode = new GainNode(audioCtx, { gain: 0 });
-		let source;
-		let modOsc;
-		let modGain;
-		let swellGain;
-		let interval;
-		let chirpBus;
-
-		if (type === 'birds') {
-			chirpBus = new GainNode(audioCtx, { gain: 1 });
-			chirpBus.connect(gainNode).connect(audioCtx.destination);
-			interval = setInterval(() => {
-				if (gainNode.gain.value <= 0.001) return;
-				const osc = new OscillatorNode(audioCtx, {
-					type: 'triangle',
-					frequency: 1150 + Math.random() * 500
-				});
-				const chirpGain = new GainNode(audioCtx, { gain: 0 });
-				osc.connect(chirpGain).connect(chirpBus);
-				const now = audioCtx.currentTime;
-				chirpGain.gain.setValueAtTime(0, now);
-				chirpGain.gain.linearRampToValueAtTime(0.16, now + 0.03);
-				chirpGain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
-				osc.frequency.exponentialRampToValueAtTime(1400 + Math.random() * 300, now + 0.16);
-				osc.start(now);
-				osc.stop(now + 0.2);
-			}, 900);
-
-			return {
-				sourceNode: chirpBus,
-				gainNode,
-				setVolume(v) {
-					gainNode.gain.setTargetAtTime(v, audioCtx.currentTime, 0.08);
-				},
-				fadeTo(v, seconds = 0.7) {
-					const now = audioCtx.currentTime;
-					gainNode.gain.cancelScheduledValues(now);
-					gainNode.gain.setValueAtTime(gainNode.gain.value, now);
-					gainNode.gain.linearRampToValueAtTime(v, now + seconds);
-				},
-				dispose() {
-					clearInterval(interval);
-					chirpBus.disconnect();
-					gainNode.disconnect();
-				}
-			};
-		}
-
-		const buffer = audioCtx.createBuffer(1, audioCtx.sampleRate * 2, audioCtx.sampleRate);
-		const data = buffer.getChannelData(0);
-		for (let i = 0; i < data.length; i += 1) data[i] = Math.random() * 2 - 1;
-
-		source = new AudioBufferSourceNode(audioCtx, { buffer, loop: true });
-		const filter = new BiquadFilterNode(audioCtx, { type: 'lowpass', frequency: 1200, Q: 0.7 });
-
-		if (type === 'wind') {
-			filter.type = 'bandpass';
-			filter.frequency.value = 420;
-		}
-		if (type === 'static') {
-			filter.type = 'highpass';
-			filter.frequency.value = 2500;
-		}
-		if (type === 'ocean') {
-			filter.type = 'lowpass';
-			filter.frequency.value = 700;
-			swellGain = new GainNode(audioCtx, { gain: 0.62 });
-			modOsc = new OscillatorNode(audioCtx, { frequency: 0.07, type: 'sine' });
-			modGain = new GainNode(audioCtx, { gain: 0.16 });
-			modOsc.connect(modGain).connect(swellGain.gain);
-			modOsc.start();
-		}
-		if (type === 'night') {
-			filter.type = 'bandpass';
-			filter.frequency.value = 1500;
-			filter.Q.value = 3.5;
-		}
-
-		if (type === 'ocean') {
-			source.connect(filter).connect(swellGain).connect(gainNode).connect(audioCtx.destination);
-		} else {
-			source.connect(filter).connect(gainNode).connect(audioCtx.destination);
-		}
-		source.start();
+	function createExternalAudioEngine(type) {
+		const externalUrl = externalAudioUrls[type];
+		if (!externalUrl) return null;
+		const mediaEl = new Audio(externalUrl);
+		let fadeTimer;
+		mediaEl.loop = true;
+		mediaEl.preload = 'auto';
+		mediaEl.volume = 0;
+		void mediaEl.play().catch(() => {
+			// autoplay can fail until first gesture
+		});
 
 		return {
-			sourceNode: source,
-			gainNode,
+			mediaEl,
 			setVolume(v) {
-				gainNode.gain.setTargetAtTime(v, audioCtx.currentTime, 0.08);
+				mediaEl.volume = Math.max(0, Math.min(1, v));
 			},
 			fadeTo(v, seconds = 0.7) {
-				const now = audioCtx.currentTime;
-				gainNode.gain.cancelScheduledValues(now);
-				gainNode.gain.setValueAtTime(gainNode.gain.value, now);
-				gainNode.gain.linearRampToValueAtTime(v, now + seconds);
+				const target = Math.max(0, Math.min(1, v));
+				if (fadeTimer) clearInterval(fadeTimer);
+				const steps = Math.max(1, Math.round(seconds * 30));
+				const start = mediaEl.volume;
+				let index = 0;
+				fadeTimer = setInterval(() => {
+					index += 1;
+					const t = Math.min(1, index / steps);
+					mediaEl.volume = start + (target - start) * t;
+					if (t >= 1) {
+						clearInterval(fadeTimer);
+						fadeTimer = null;
+					}
+				}, 1000 / 30);
 			},
 			dispose() {
-				if (modOsc) {
-					modOsc.stop();
-					modOsc.disconnect();
-				}
-				if (modGain) modGain.disconnect();
-				if (swellGain) swellGain.disconnect();
-				source.stop();
-				source.disconnect();
-				filter.disconnect();
-				gainNode.disconnect();
+				if (fadeTimer) clearInterval(fadeTimer);
+				mediaEl.pause();
+				mediaEl.src = '';
+				mediaEl.load();
 			}
 		};
 	}
@@ -522,14 +461,12 @@
 
 	function attachEngineToBubble(bubble, engine) {
 		bubble.engine = engine;
-		bubble.audioSource = engine.sourceNode;
-		bubble.gainNode = engine.gainNode;
 	}
 
 	function ensureBubbleEngine(bubble) {
 		if (bubble.engine) return;
-		ensureContext();
-		const engine = createNoiseEngine(bubble.sourceType.split('+')[0]);
+		const engine = createExternalAudioEngine(bubble.sourceType);
+		if (!engine) return;
 		attachEngineToBubble(bubble, engine);
 	}
 
@@ -538,8 +475,6 @@
 			if (bubble.engine) {
 				bubble.engine.dispose();
 				bubble.engine = null;
-				bubble.audioSource = null;
-				bubble.gainNode = null;
 			}
 			return;
 		}
@@ -550,7 +485,6 @@
 	}
 
 	function toggleBubble(uid) {
-		ensureContext();
 		bubbles = bubbles.map((bubble) => {
 			if (bubble.uid !== uid) return bubble;
 			const next = { ...bubble, active: !bubble.active };
@@ -570,7 +504,6 @@
 	}
 
 	function applyMix(mix) {
-		ensureContext();
 		bubbles = bubbles.map((bubble) => {
 			const value = mix[bubble.sourceType] ?? 0;
 			const next = { ...bubble, volume: value || bubble.volume, active: value > 0 };
@@ -646,8 +579,6 @@
 			radius: newRadius,
 			mass: newMass,
 			pulseFrequency: newPulseFrequency,
-			audioSource: null,
-			gainNode: null,
 			engine: null,
 			fusing: false,
 			separating: false,
@@ -764,8 +695,6 @@
 			radius: radiusA,
 			mass: massA,
 			pulseFrequency: Math.max(0.04, parent.pulseFrequency * 0.92),
-			audioSource: null,
-			gainNode: null,
 			engine: null,
 			fusing: false,
 			separating: true,
@@ -795,8 +724,6 @@
 			radius: radiusB,
 			mass: massB,
 			pulseFrequency: parent.pulseFrequency * 1.08,
-			audioSource: null,
-			gainNode: null,
 			engine: null,
 			fusing: false,
 			separating: true,
@@ -1024,9 +951,15 @@
 	}
 
 	function saveMix() {
-		const snapshot = Object.fromEntries(
-			bubbles.filter((b) => b.active).map((b) => [b.sourceType, Number(b.volume.toFixed(2))])
-		);
+		const snapshot = {};
+		for (const bubble of bubbles) {
+			if (!bubble.active) continue;
+			const value = Number(bubble.volume.toFixed(2));
+			const keys = bubble.components?.length ? [...new Set(bubble.components)] : [bubble.sourceType];
+			for (const key of keys) {
+				snapshot[key] = Math.max(snapshot[key] ?? 0, value);
+			}
+		}
 		if (!Object.keys(snapshot).length) return;
 		const label = mixLabel.trim() || `Jar ${mixes.length + 1}`;
 		mixes = [{ label, mix: snapshot, id: Date.now() }, ...mixes];
@@ -1128,6 +1061,13 @@
 		loadMix(jar);
 		activeJarKey = jarKey;
 	}
+
+	function removeMix(id) {
+		mixes = mixes.filter((mix) => mix.id !== id);
+		if (activeJarKey === `mix:${id}`) activeJarKey = null;
+		if (draggingMixId === id) draggingMixId = null;
+		if (mixPointerDrag?.id === id) mixPointerDrag = null;
+	}
 </script>
 
 <main class="workspace" style={`--bgA:${palette.bgA};--bgB:${palette.bgB};--panel:${palette.panel};--bubble:${palette.bubble};--text:${palette.text};--soft:${palette.soft};`}>
@@ -1190,18 +1130,29 @@
 					<h3>Saved Jars</h3>
 					<div class="jar-grid">
 						{#each mixes as jar}
-							<button
-								class="jar"
-								class:dragging={draggingMixId === jar.id}
-								style={jarToneStyle()}
-								on:pointerdown={(event) => startMixPointerDrag(event, jar.id)}
-								on:pointerenter={() => hoverMixTarget(jar.id)}
-								on:click={() => handleSavedJarClick(jar)}
-							>
-								<div class="lid"></div>
-								<div class="liquid" style={jarLiquidStyle(jar.mix)}></div>
-								<p>{jar.label}</p>
-							</button>
+							<div class="jar-wrap">
+								<button
+									class="jar"
+									class:dragging={draggingMixId === jar.id}
+									style={jarToneStyle()}
+									on:pointerdown={(event) => startMixPointerDrag(event, jar.id)}
+									on:pointerenter={() => hoverMixTarget(jar.id)}
+									on:click={() => handleSavedJarClick(jar)}
+								>
+									<div class="lid"></div>
+									<div class="liquid" style={jarLiquidStyle(jar.mix)}></div>
+									<p>{jar.label}</p>
+								</button>
+								<button
+									class="jar-delete"
+									aria-label={`Delete ${jar.label}`}
+									title="Delete jar"
+									on:pointerdown|stopPropagation
+									on:click|stopPropagation={() => removeMix(jar.id)}
+								>
+									×
+								</button>
+							</div>
 						{/each}
 					</div>
 				</section>
@@ -1571,7 +1522,12 @@
 		margin-top: 0.8rem;
 	}
 
+	.jar-wrap {
+		position: relative;
+	}
+
 	.jar {
+		width: 100%;
 		border: 1px solid rgba(194, 223, 255, 0.22);
 		border-radius: 1rem;
 		padding: 0.6rem 0.5rem;
@@ -1589,6 +1545,27 @@
 	.jar.dragging {
 		opacity: 0.56;
 		transform: scale(0.97);
+	}
+
+	.jar-delete {
+		position: absolute;
+		top: 0.28rem;
+		right: 0.3rem;
+		width: 1.2rem;
+		height: 1.2rem;
+		border: 1px solid rgba(197, 223, 255, 0.25);
+		border-radius: 999px;
+		background: rgba(26, 45, 78, 0.52);
+		color: rgba(228, 239, 255, 0.92);
+		font-size: 0.92rem;
+		line-height: 1;
+		padding: 0;
+		cursor: pointer;
+		backdrop-filter: blur(8px);
+	}
+
+	.jar-delete:hover {
+		background: rgba(43, 71, 116, 0.72);
 	}
 
 	.lid {
