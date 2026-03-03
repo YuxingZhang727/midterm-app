@@ -126,6 +126,7 @@
 	let breathVideoEl;
 	let breathStream = null;
 	let breathMonitor = null;
+	let handCheckTimer = null;
 	let handCheckEnabled = false;
 	let handDetected = false;
 	let handCheckStatus = 'Hand check off';
@@ -190,14 +191,12 @@
 				: `${names[0]} + ${names.length - 1} more`
 			: 'Breathing Bubble';
 		const sourceCount = isPlaying ? names.length : 0;
-		const namesText = isPlaying ? names.join(' · ') : 'No audio selected';
 		return {
 			isPlaying,
 			volume,
 			label,
 			count: active.length,
-			sourceCount,
-			namesText
+			sourceCount
 		};
 	}
 
@@ -215,7 +214,7 @@
 				breathVideoEl.srcObject = breathStream;
 				if (breathVideoEl.paused) await breathVideoEl.play();
 			}
-			if (!breathMonitor) {
+			if (!breathMonitor || !breathMonitor.running) {
 				breathMonitor = new FaceMeshBreathMonitor();
 				await breathMonitor.start(breathVideoEl, (result) => {
 					breathDetectedPhase = result.phase;
@@ -233,6 +232,10 @@
 	}
 
 	function teardownBreathMonitor() {
+		if (handCheckTimer) {
+			clearTimeout(handCheckTimer);
+			handCheckTimer = null;
+		}
 		breathMonitor?.stop();
 		breathMonitor = null;
 		if (breathStream) {
@@ -265,12 +268,26 @@
 			handCheckEnabled = false;
 			handDetected = false;
 			handCheckStatus = 'Hand check off';
+			if (handCheckTimer) {
+				clearTimeout(handCheckTimer);
+				handCheckTimer = null;
+			}
 			if (!breathTraining) teardownBreathMonitor();
 			return;
 		}
 		const ok = await ensureBreathMonitorRunning();
 		handCheckEnabled = ok;
+		handDetected = false;
 		handCheckStatus = ok ? 'Checking hand...' : 'Hand check unavailable';
+		if (ok) {
+			if (handCheckTimer) clearTimeout(handCheckTimer);
+			handCheckTimer = setTimeout(() => {
+				if (handCheckEnabled && !handDetected && handCheckStatus === 'Checking hand...') {
+					handCheckStatus = 'Hand not detected';
+				}
+				handCheckTimer = null;
+			}, 2800);
+		}
 	}
 
 	function toggleBreathTraining() {
@@ -1304,7 +1321,6 @@
 					</span>
 				</div>
 				<h3>{breathMasterBubble.label}</h3>
-				<p>{breathMasterBubble.namesText}</p>
 			</article>
 		{:else}
 			{#each bubbles as bubble}
@@ -1728,15 +1744,6 @@
 	.master-bubble-shell h3 {
 		font-size: 0.93rem;
 		color: rgba(216, 233, 255, 0.94);
-	}
-
-	.master-bubble-shell p {
-		margin: 0;
-		font-size: 0.78rem;
-		color: rgba(199, 221, 251, 0.92);
-		padding: 0.14rem 0.52rem;
-		background: rgba(255, 255, 255, 0.1);
-		border-radius: 999px;
 	}
 
 	.bubble-hint {
