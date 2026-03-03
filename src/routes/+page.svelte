@@ -2,6 +2,7 @@
 	import { browser } from '$app/environment';
 	import { onDestroy, onMount } from 'svelte';
 	import Matter from 'matter-js';
+	import { FaceMeshBreathMonitor } from '$lib/breathing/handBreath.js';
 
 	const bubbleDefs = [
 		{ id: 'rain1', label: 'Rain 1', icon: 'R1' },
@@ -112,11 +113,170 @@
 	let fusionContactSince = new Map();
 	let clock = 0;
 	let lastFrameMs = 0;
+	let breathTraining = false;
+	let breathStartedAt = 0;
+	let breathExpectedPhase = 'Inhale';
+	let breathExpectedProgress = 0;
+	let breathCountdown = 4;
+	let breathCycleCount = 1;
+	let breathDetectedPhase = 'Unknown';
+	let breathFeedback = 'Start 4-7-8';
+	let breathCorrect = false;
+	let breathPermissionError = '';
+	let breathVideoEl;
+	let breathStream = null;
+	let breathMonitor = null;
+	let handCheckEnabled = false;
+	let handDetected = false;
+	let handCheckStatus = 'Hand check off';
+
+	const breathSequence = [
+		{ phase: 'Inhale', duration: 4 },
+		{ phase: 'Hold', duration: 7 },
+		{ phase: 'Exhale', duration: 8 }
+	];
+	const breathCycleDuration = breathSequence.reduce((sum, step) => sum + step.duration, 0);
 
 	const labelBySource = Object.fromEntries(bubbleDefs.map((item) => [item.id, item.label]));
 
 	$: palette = calmScene.colors;
 	$: activeCount = bubbles.filter((b) => b.active).length;
+	$: breathMasterBubble = buildBreathMasterBubble();
+
+	function computeBreathGuide(nowSec) {
+		const elapsed = Math.max(0, nowSec - breathStartedAt);
+		const cycleElapsed = elapsed % breathCycleDuration;
+		let cursor = 0;
+		for (const step of breathSequence) {
+			if (cycleElapsed <= cursor + step.duration) {
+				const localElapsed = cycleElapsed - cursor;
+				const progress = Math.max(0, Math.min(1, localElapsed / step.duration));
+				return {
+					phase: step.phase,
+					progress,
+					countdown: Math.max(1, Math.ceil(step.duration - localElapsed)),
+					cycleCount: Math.floor(elapsed / breathCycleDuration) + 1
+				};
+			}
+			cursor += step.duration;
+		}
+		return { phase: 'Exhale', progress: 1, countdown: 1, cycleCount: 1 };
+	}
+
+	function evaluateBreathCorrectness(expected, detected) {
+		if (detected === 'Unknown' || detected === 'Calibrating') return false;
+		if (expected === 'Hold') return detected !== 'Exhale';
+		return expected === detected;
+	}
+
+	function breathingScale(phase, progress) {
+		if (!breathTraining) return 1;
+		if (phase === 'Inhale') return 0.9 + progress * 0.2;
+		if (phase === 'Hold') return 1.1;
+		return 1.1 - progress * 0.24;
+	}
+
+	function buildBreathMasterBubble() {
+		const active = bubbles.filter((b) => b.active);
+		const isPlaying = active.length > 0;
+		const volume = isPlaying
+			? active.reduce((sum, item) => sum + item.volume, 0) / Math.max(1, active.length)
+			: 0.4;
+		const names = [...new Set(active.flatMap((b) => b.components ?? [b.sourceType]))]
+			.map((id) => labelBySource[id] ?? id);
+		const label = isPlaying
+			? names.length <= 2
+				? names.join(' + ')
+				: `${names[0]} + ${names.length - 1} more`
+			: 'Breathing Bubble';
+		const sourceCount = isPlaying ? names.length : 0;
+		const namesText = isPlaying ? names.join(' · ') : 'No audio selected';
+		return {
+			isPlaying,
+			volume,
+			label,
+			count: active.length,
+			sourceCount,
+			namesText
+		};
+	}
+
+	async function ensureBreathMonitorRunning() {
+		if (!browser) return false;
+		breathPermissionError = '';
+		try {
+			if (!breathStream) {
+				breathStream = await navigator.mediaDevices.getUserMedia({
+					video: { facingMode: 'user' },
+					audio: false
+				});
+			}
+			if (breathVideoEl) {
+				breathVideoEl.srcObject = breathStream;
+				if (breathVideoEl.paused) await breathVideoEl.play();
+			}
+			if (!breathMonitor) {
+				breathMonitor = new FaceMeshBreathMonitor();
+				await breathMonitor.start(breathVideoEl, (result) => {
+					breathDetectedPhase = result.phase;
+					handDetected = !!result.handVisible;
+					if (result.phase === 'Calibrating') handCheckStatus = 'Checking hand...';
+					else if (result.phase === 'Unknown') handCheckStatus = 'Hand not detected';
+					else handCheckStatus = 'Hand detected';
+				});
+			}
+			return true;
+		} catch (error) {
+			breathPermissionError = 'Camera permission is required for breathing detection.';
+			return false;
+		}
+	}
+
+	function teardownBreathMonitor() {
+		breathMonitor?.stop();
+		breathMonitor = null;
+		if (breathStream) {
+			for (const track of breathStream.getTracks()) track.stop();
+			breathStream = null;
+		}
+		if (breathVideoEl) breathVideoEl.srcObject = null;
+	}
+
+	async function startBreathTraining() {
+		if (!browser || breathTraining) return;
+		const ok = await ensureBreathMonitorRunning();
+		if (!ok) {
+			breathTraining = false;
+			return;
+		}
+		breathStartedAt = clock;
+		breathTraining = true;
+		breathFeedback = 'Follow bubble rhythm';
+	}
+
+	function stopBreathTraining() {
+		breathTraining = false;
+		breathFeedback = 'Start 4-7-8';
+		if (!handCheckEnabled) teardownBreathMonitor();
+	}
+
+	async function toggleHandCheck() {
+		if (handCheckEnabled) {
+			handCheckEnabled = false;
+			handDetected = false;
+			handCheckStatus = 'Hand check off';
+			if (!breathTraining) teardownBreathMonitor();
+			return;
+		}
+		const ok = await ensureBreathMonitorRunning();
+		handCheckEnabled = ok;
+		handCheckStatus = ok ? 'Checking hand...' : 'Hand check unavailable';
+	}
+
+	function toggleBreathTraining() {
+		if (breathTraining) stopBreathTraining();
+		else void startBreathTraining();
+	}
 
 	function initPhysics() {
 		if (!bubbleStageEl) return;
@@ -398,6 +558,8 @@
 		if (rafId) cancelAnimationFrame(rafId);
 		destroyPhysics();
 		void hardStopAudio();
+		stopBreathTraining();
+		teardownBreathMonitor();
 	});
 
 	$: if (browser && mixes) {
@@ -861,6 +1023,21 @@
 
 	function runFusionLoop(nowMs) {
 		clock = nowMs / 1000;
+		if (breathTraining) {
+			const guide = computeBreathGuide(clock);
+			breathExpectedPhase = guide.phase;
+			breathExpectedProgress = guide.progress;
+			breathCountdown = guide.countdown;
+			breathCycleCount = guide.cycleCount;
+			breathCorrect = evaluateBreathCorrectness(breathExpectedPhase, breathDetectedPhase);
+			if (breathDetectedPhase === 'Calibrating') {
+				breathFeedback = 'Calibrating hand... keep one hand visible';
+			} else if (breathDetectedPhase === 'Unknown') {
+				breathFeedback = 'Hand not detected';
+			} else {
+				breathFeedback = breathCorrect ? 'Great rhythm' : 'Adjust breath to bubble';
+			}
+		}
 		const dt = Math.min(2.2, Math.max(0.6, (nowMs - (lastFrameMs || nowMs)) / 16.67));
 		lastFrameMs = nowMs;
 		const dragForced = applyDragForce(dt);
@@ -1076,31 +1253,84 @@
 			<h1>{calmScene.title}</h1>
 			<p>{calmScene.subtitle}</p>
 		</div>
+		<div class="breath-panel">
+			<div class="breath-actions">
+				<button class="breath-btn" class:active={handCheckEnabled} on:click={toggleHandCheck}>
+					{handCheckEnabled ? 'Stop Check' : 'Check Hand'}
+				</button>
+				<button class="breath-btn" class:active={breathTraining} on:click={toggleBreathTraining}>
+				{breathTraining ? 'Stop 4-7-8' : 'Start 4-7-8'}
+			</button>
+			</div>
+			{#if handCheckEnabled}
+				<p class="breath-text" class:ok={handDetected} class:warn={!handDetected}>
+					{handCheckStatus}
+				</p>
+			{/if}
+			{#if !breathTraining && breathPermissionError}
+				<p class="breath-text warn">{breathPermissionError}</p>
+			{/if}
+		</div>
 	</section>
 
 	<section class="bubble-stage" bind:this={bubbleStageEl} on:wheel|preventDefault>
-		{#each bubbles as bubble}
-			{@const pulse = 1 + 0.1 * Math.sin(2 * Math.PI * bubble.pulseFrequency * clock)}
-			{@const emergeRaw = Math.min(1, Math.max(0, (clock - (bubble.bornAt ?? 0)) / 0.95))}
-			{@const emerge = easeOutCubic(emergeRaw)}
-			{@const emergeScale = 0.72 + emerge * 0.28}
-			{@const scale = (0.82 + bubble.volume * 0.5) * pulse * bubble.fusionScale * emergeScale}
-			{@const opacity = (0.35 + bubble.volume * 0.65) * bubble.fusionOpacity * (0.25 + emerge * 0.75)}
-			<article class="bubble-shell" style={`--scale:${scale};--opacity:${opacity};--emerge:${emerge};--drift:${bubble.drift}s;--floatState:${bubble.fusing ? 'paused' : 'running'};--diameter:${bubble.radius * 2}px;left:${bubble.x ?? 0}px;top:${bubble.y ?? 0}px;`}>
-				<button
-					class="bubble"
-					class:active={bubble.active}
-					class:fusing={bubble.fusing}
-					on:pointerdown={(e) => startBubbleDrag(e, bubble)}
-					on:dblclick|preventDefault={() => handleBubbleDoubleClick(bubble.uid)}
-					on:wheel|preventDefault={(e) => adjustVolumeWithWheel(e, bubble.uid)}
-					aria-pressed={bubble.active}
-					aria-label={`${bubble.label}, ${Math.round(bubble.volume * 100)} percent volume`}
-				></button>
-				<h3>{bubble.label}</h3>
-				<p>{Math.round(bubble.volume * 100)}%</p>
+		<video
+			bind:this={breathVideoEl}
+			class="breath-video"
+			class:preview={handCheckEnabled}
+			autoplay
+			playsinline
+			muted
+			width="640"
+			height="480"
+		></video>
+		{#if breathTraining}
+			{@const masterScale =
+				(1.18 + breathMasterBubble.volume * 0.36) *
+				breathingScale(breathExpectedPhase, breathExpectedProgress)}
+			{@const masterOpacity = 0.52 + breathMasterBubble.volume * 0.42}
+			<article class="master-bubble-shell" style={`--scale:${masterScale};--opacity:${masterOpacity};`}>
+				<div class="bubble master-bubble" class:active={breathMasterBubble.isPlaying}>
+					<span class={`master-phase-word phase-${breathExpectedPhase.toLowerCase()}`}>{breathExpectedPhase}</span>
+					<span class="master-phase-time">{breathCountdown}s</span>
+					<span
+						class={`master-detect ${breathDetectedPhase === 'Calibrating' ? 'neutral' : breathCorrect ? 'ok' : 'warn'}`}
+					>
+						{breathDetectedPhase === 'Unknown'
+							? 'Hand not detected'
+							: breathDetectedPhase === 'Calibrating'
+								? 'Calibrating hand...'
+								: `Detected ${breathDetectedPhase}`}
+					</span>
+				</div>
+				<h3>{breathMasterBubble.label}</h3>
+				<p>{breathMasterBubble.namesText}</p>
 			</article>
-		{/each}
+		{:else}
+			{#each bubbles as bubble}
+				{@const pulse = 1 + 0.1 * Math.sin(2 * Math.PI * bubble.pulseFrequency * clock)}
+				{@const emergeRaw = Math.min(1, Math.max(0, (clock - (bubble.bornAt ?? 0)) / 0.95))}
+				{@const emerge = easeOutCubic(emergeRaw)}
+				{@const emergeScale = 0.72 + emerge * 0.28}
+				{@const scale = (0.82 + bubble.volume * 0.5) * pulse * bubble.fusionScale * emergeScale}
+				{@const opacity =
+					(0.35 + bubble.volume * 0.65) * bubble.fusionOpacity * (0.25 + emerge * 0.75)}
+				<article class="bubble-shell" style={`--scale:${scale};--opacity:${opacity};--emerge:${emerge};--drift:${bubble.drift}s;--floatState:${bubble.fusing ? 'paused' : 'running'};--diameter:${bubble.radius * 2}px;left:${bubble.x ?? 0}px;top:${bubble.y ?? 0}px;`}>
+					<button
+						class="bubble"
+						class:active={bubble.active}
+						class:fusing={bubble.fusing}
+						on:pointerdown={(e) => startBubbleDrag(e, bubble)}
+						on:dblclick|preventDefault={() => handleBubbleDoubleClick(bubble.uid)}
+						on:wheel|preventDefault={(e) => adjustVolumeWithWheel(e, bubble.uid)}
+						aria-pressed={bubble.active}
+						aria-label={`${bubble.label}, ${Math.round(bubble.volume * 100)} percent volume`}
+					></button>
+					<h3>{bubble.label}</h3>
+					<p>{Math.round(bubble.volume * 100)}%</p>
+				</article>
+			{/each}
+		{/if}
 		<p class="bubble-hint">Drag to move, click to toggle, wheel to adjust volume.</p>
 	</section>
 
@@ -1219,6 +1449,48 @@
 		color: var(--soft);
 	}
 
+	.breath-panel {
+		display: grid;
+		justify-items: end;
+		gap: 0.24rem;
+	}
+
+	.breath-actions {
+		display: flex;
+		gap: 0.35rem;
+		align-items: flex-start;
+	}
+
+	.breath-btn {
+		border: 1px solid rgba(197, 223, 255, 0.2);
+		border-radius: 0.85rem;
+		background: rgba(136, 182, 250, 0.08);
+		color: var(--text);
+		padding: 0.5rem 0.8rem;
+		cursor: pointer;
+		backdrop-filter: blur(16px) saturate(118%);
+		pointer-events: auto;
+	}
+
+	.breath-btn.active {
+		border-color: rgba(198, 235, 255, 0.46);
+		background: rgba(148, 198, 255, 0.22);
+	}
+
+	.breath-text {
+		margin: 0;
+		font-size: 0.78rem;
+		color: rgba(214, 233, 255, 0.92);
+	}
+
+	.breath-text.ok {
+		color: rgba(188, 255, 215, 0.95);
+	}
+
+	.breath-text.warn {
+		color: rgba(255, 206, 190, 0.95);
+	}
+
 	.save-box button,
 	.clear,
 	.drawer-toggle {
@@ -1254,6 +1526,78 @@
 		animation: float 7s ease-in-out infinite;
 		animation-delay: calc(var(--drift) * -1s);
 		animation-play-state: var(--floatState);
+	}
+
+	.master-bubble-shell {
+		position: absolute;
+		left: 50%;
+		top: 50%;
+		transform: translate(-50%, -50%);
+		display: grid;
+		justify-items: center;
+		gap: 0.45rem;
+	}
+
+	.master-bubble {
+		--diameter: clamp(170px, 19vw, 236px);
+		pointer-events: none;
+		display: grid;
+		align-content: center;
+		justify-items: center;
+		gap: 0.2rem;
+	}
+
+	.master-phase-word {
+		font-size: clamp(1rem, 1.2vw, 1.22rem);
+		font-weight: 700;
+		letter-spacing: 0.02em;
+		text-shadow: 0 1px 10px rgba(64, 104, 168, 0.35);
+	}
+
+	.master-phase-word.phase-inhale {
+		color: rgba(177, 238, 255, 0.98);
+	}
+
+	.master-phase-word.phase-hold {
+		color: rgba(255, 232, 182, 0.98);
+	}
+
+	.master-phase-word.phase-exhale {
+		color: rgba(200, 255, 214, 0.98);
+	}
+
+	.master-phase-time {
+		font-size: clamp(0.8rem, 1vw, 0.95rem);
+		color: rgba(217, 235, 255, 0.9);
+		padding: 0.1rem 0.42rem;
+		background: rgba(255, 255, 255, 0.1);
+		border: 1px solid rgba(214, 235, 255, 0.22);
+		border-radius: 999px;
+	}
+
+	.master-detect {
+		font-size: 0.72rem;
+		padding: 0.08rem 0.45rem;
+		border-radius: 999px;
+		border: 1px solid rgba(214, 235, 255, 0.2);
+	}
+
+	.master-detect.ok {
+		color: rgba(204, 255, 222, 0.98);
+		background: rgba(93, 172, 126, 0.2);
+		border-color: rgba(153, 233, 186, 0.42);
+	}
+
+	.master-detect.warn {
+		color: rgba(255, 223, 206, 0.98);
+		background: rgba(172, 101, 93, 0.2);
+		border-color: rgba(239, 161, 145, 0.42);
+	}
+
+	.master-detect.neutral {
+		color: rgba(220, 232, 255, 0.95);
+		background: rgba(113, 142, 188, 0.2);
+		border-color: rgba(183, 206, 241, 0.42);
 	}
 
 	.bubble {
@@ -1378,6 +1722,20 @@
 		color: var(--soft);
 		padding: 0.12rem 0.4rem;
 		background: rgba(255, 255, 255, 0.12);
+		border-radius: 999px;
+	}
+
+	.master-bubble-shell h3 {
+		font-size: 0.93rem;
+		color: rgba(216, 233, 255, 0.94);
+	}
+
+	.master-bubble-shell p {
+		margin: 0;
+		font-size: 0.78rem;
+		color: rgba(199, 221, 251, 0.92);
+		padding: 0.14rem 0.52rem;
+		background: rgba(255, 255, 255, 0.1);
 		border-radius: 999px;
 	}
 
@@ -1628,5 +1986,27 @@
 			width: 74px;
 			height: 74px;
 		}
+	}
+
+	.breath-video {
+		display: none;
+	}
+
+	.breath-video.preview {
+		display: block;
+		position: absolute;
+		right: 0.75rem;
+		top: 0.75rem;
+		width: 190px;
+		height: 142px;
+		opacity: 0.9;
+		box-shadow: 0 8px 22px rgba(12, 27, 54, 0.36);
+		background: rgba(24, 52, 96, 0.22);
+		backdrop-filter: blur(10px);
+		border-radius: 0.75rem;
+		border: 1px solid rgba(195, 223, 255, 0.28);
+		object-fit: cover;
+		transform: scaleX(-1);
+		z-index: 14;
 	}
 </style>
