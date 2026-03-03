@@ -141,9 +141,7 @@ Related references:
 
 ## Roadmap
 Planned next steps:
-- Add user-adjustable detection sensitivity
-- Add keyboard accessibility mappings
-- Improve mobile camera and touch ergonomics
-- Add export/import for cabinet mixes
-- Add mood-based presets (Sleep / Focus / Custom)
-- Refine breathing coaching with adaptive phase timing
+
+- Integrate a larger white-noise API/library to provide a wider range of ambient sound options.
+- Support user-uploaded audio files so people can build personalized soundscapes with their own recordings.
+- Improve breathing-detection accuracy beyond the current simple hand-motion model by exploring multimodal sensing approaches (for example: combining hand trajectory, body pose, and optional microphone breath signal), plus better smoothing/calibration logic and personalized sensitivity settings.
